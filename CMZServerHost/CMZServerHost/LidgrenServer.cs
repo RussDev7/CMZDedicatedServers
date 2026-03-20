@@ -122,7 +122,7 @@ namespace CMZServerHost
         /// <summary>
         /// Reflected connections collection from NetPeer.
         /// </summary>
-        private object _connections;
+        //private object _connections;
 
         /// <summary>
         /// Next player GID assigned to newly joined remote clients.
@@ -201,6 +201,11 @@ namespace CMZServerHost
         /// Last time-of-day broadcast timestamp.
         /// </summary>
         private DateTime _lastTimeOfDaySend = DateTime.MinValue;
+
+        private DateTime _lastTimeOfDayAdvance = DateTime.UtcNow;
+
+        // 0..1 is a full day.
+        private const float SecondsPerFullDay = 960f; // match GameScreen.LengthOfDay = 16 minutes
 
         #endregion
 
@@ -381,7 +386,7 @@ namespace CMZServerHost
                 throw new InvalidOperationException("NetPeer.Start failed: " + (inner?.Message ?? tex.Message), inner);
             }
 
-            _connections = peerType.GetProperty("Connections").GetValue(_netPeer);
+            // _connections = peerType.GetProperty("Connections").GetValue(_netPeer);
 
             CreateHostGamer(xnaAsm);
 
@@ -501,33 +506,45 @@ namespace CMZServerHost
                 }
             }
 
-            // Time of day: advance and broadcast every ~2 seconds
-            if (_worldHandler != null && _connections != null)
+            // Time of day: Advance using real elapsed time and broadcast periodically.
+            if (_worldHandler != null)
             {
-                _timeOfDay += 1f / 3600f; // ~1 real minute per full day at 60 Hz
-                if (_timeOfDay >= 1f)
-                    _timeOfDay -= 1f;
+                DateTime now = DateTime.UtcNow;
+                float deltaSeconds = (float)(now - _lastTimeOfDayAdvance).TotalSeconds;
+                _lastTimeOfDayAdvance = now;
 
-                if ((DateTime.UtcNow - _lastTimeOfDaySend).TotalSeconds >= 2.0)
+                if (deltaSeconds < 0f)
+                    deltaSeconds = 0f;
+                if (deltaSeconds > 1f)
+                    deltaSeconds = 1f; // Avoids huge jumps if paused/debugged.
+
+                _timeOfDay += deltaSeconds / SecondsPerFullDay;
+
+                if ((now - _lastTimeOfDaySend).TotalSeconds >= 5.0)
                 {
-                    _lastTimeOfDaySend = DateTime.UtcNow;
+                    _lastTimeOfDaySend = now;
+
                     var payload = _worldHandler.BuildTimeOfDayPayload(_timeOfDay);
                     if (payload != null && payload.Length > 0)
                     {
                         var reliableOrdered = Enum.Parse(_commonAsm.GetType("DNA.Net.Lidgren.NetDeliveryMethod"), "ReliableOrdered");
                         var liveConnections = GetLiveConnections();
-                        if (liveConnections == null)
-                            return;
 
-                        foreach (var conn in liveConnections)
+                        if (liveConnections != null)
                         {
-                            if (!_connectionToGamer.TryGetValue(conn, out var gamer))
-                                continue;
+                            foreach (var conn in liveConnections)
+                            {
+                                if (!_connectionToGamer.TryGetValue(conn, out var gamer))
+                                    continue;
 
-                            var gamerId = (byte)gamer.GetType().GetProperty("Id").GetValue(gamer);
-                            var om = peerType.GetMethod("CreateMessage", Type.EmptyTypes).Invoke(_netPeer, null);
-                            WriteChannel0Packet(om, gamerId, 0, payload);
-                            conn.GetType().GetMethod("SendMessage", new[] { om.GetType(), reliableOrdered.GetType(), typeof(int) })?.Invoke(conn, new[] { om, reliableOrdered, 0 });
+                                var gamerId = (byte)gamer.GetType().GetProperty("Id").GetValue(gamer);
+                                var om = peerType.GetMethod("CreateMessage", Type.EmptyTypes).Invoke(_netPeer, null);
+                                WriteChannel0Packet(om, gamerId, 0, payload);
+
+                                conn.GetType()
+                                    .GetMethod("SendMessage", new[] { om.GetType(), reliableOrdered.GetType(), typeof(int) })
+                                    ?.Invoke(conn, new[] { om, reliableOrdered, 0 });
+                            }
                         }
                     }
                 }
@@ -1152,7 +1169,7 @@ namespace CMZServerHost
 
         private void SendChannel0PayloadToAll(byte[] payload, byte senderId, byte? exceptPlayerId = null)
         {
-            if (_netPeer == null || _connections == null || payload == null)
+            if (_netPeer == null || payload == null)
                 return;
 
             var deliveryType = _commonAsm.GetType("DNA.Net.Lidgren.NetDeliveryMethod");
