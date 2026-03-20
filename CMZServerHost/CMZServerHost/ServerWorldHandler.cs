@@ -4,12 +4,13 @@ Copyright (c) 2025 RussDev7, unknowghost0
 This file is part of https://github.com/RussDev7/CMZDedicatedServer - see LICENSE for details.
 */
 
-using System.Runtime.CompilerServices;
-using System.Collections.Generic;
-using System.Reflection;
-using System.Text;
-using System.IO;
 using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Runtime.CompilerServices;
+using System.Text;
 
 namespace CMZServerHost
 {
@@ -529,6 +530,18 @@ namespace CMZServerHost
             if (typeName == "DNA.CastleMinerZ.Net.DestroyCrateMessage")
             {
                 HandleDestroyCrateMessage(senderId, data);
+                return false;
+            }
+
+            if (typeName == "DNA.CastleMinerZ.Net.CreatePickupMessage")
+            {
+                HandleCreatePickupMessage(senderId, data);
+                return false; // still relay so peers can see the spawned pickup
+            }
+
+            if (typeName == "DNA.CastleMinerZ.Net.RequestPickupMessage")
+            {
+                HandleRequestPickupMessage(senderId, data, senderConn, connections, connectionToGamer, sendToClient);
                 return false;
             }
 
@@ -1753,6 +1766,275 @@ namespace CMZServerHost
             _chunkCacheNodes.Remove(key);
         }
         #endregion
+
+        #region Pickup handlers
+
+        /// <summary>
+        /// Caches a newly created pickup so the host can later validate and resolve RequestPickupMessage.
+        ///
+        /// Notes:
+        /// - The original CreatePickupMessage is still relayed normally to peers by the transport layer.
+        /// - The host only stores enough state to later build a ConsumePickupMessage.
+        /// </summary>
+        private void HandleCreatePickupMessage(byte senderId, byte[] data)
+        {
+            try
+            {
+                // Full payload layout:
+                // [msgId][SpawnPosition:12][SpawnVector:12][PickupID:4][Item:variable][Dropped:1][DisplayOnPickup:1][checksum:1]
+
+                if (data == null || data.Length < 32)
+                {
+                    _log($"[HostMsg] CreatePickupMessage from player {senderId} ignored; packet too small.");
+                    return;
+                }
+
+                int msgIdOffset = 0;
+                int bodyOffset = msgIdOffset + 1;
+                int checksumOffset = data.Length - 1;
+
+                int spawnPosOffset = bodyOffset + 0;
+                int pickupIdOffset = bodyOffset + 24;
+                int itemOffset = bodyOffset + 28;
+
+                int flagsOffset = checksumOffset - 2 + 1; // last two bytes before checksum are Dropped, DisplayOnPickup
+                                                          // simpler:
+                flagsOffset = data.Length - 3;
+
+                int itemLength = flagsOffset - itemOffset;
+                if (itemLength < 0)
+                {
+                    _log($"[HostMsg] CreatePickupMessage from player {senderId} ignored; invalid item length.");
+                    return;
+                }
+
+                int pickupId = BitConverter.ToInt32(data, pickupIdOffset);
+
+                var pickupPositionBytes = new byte[12];
+                Buffer.BlockCopy(data, spawnPosOffset, pickupPositionBytes, 0, 12);
+
+                var itemBytes = new byte[itemLength];
+                if (itemLength > 0)
+                    Buffer.BlockCopy(data, itemOffset, itemBytes, 0, itemLength);
+
+                bool displayOnPickup = data[flagsOffset + 1] != 0;
+
+                _pendingPickupsById[pickupId] = new PendingPickup
+                {
+                    PickupID = pickupId,
+                    PickupPositionBytes = pickupPositionBytes,
+                    ItemBytes = itemBytes,
+                    DisplayOnPickup = displayOnPickup
+                };
+
+                _log($"[HostMsg] CreatePickupMessage from player {senderId}, pickupId={pickupId}, itemBytes={itemLength}, display={displayOnPickup}");
+            }
+            catch (Exception ex)
+            {
+                _log("ServerWorld HandleCreatePickupMessage: " + ex.GetType().FullName + ": " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// Resolves a pickup request on the host and broadcasts a ConsumePickupMessage to all connected clients.
+        ///
+        /// Purpose:
+        /// - Removes the pending pickup from the host cache.
+        /// - Tells every client that the pickup was consumed by the requesting player.
+        ///
+        /// Notes:
+        /// - The local game client is expected to apply the pickup/inventory effect when it receives
+        ///   ConsumePickupMessage through PickupManager.HandleMessage(...).
+        /// - This mirrors the host-authoritative pattern better than relaying RequestPickupMessage itself.
+        /// </summary>
+        private void HandleRequestPickupMessage(
+            byte senderId,
+            byte[] data,
+            object senderConn,
+            object connections,
+            Dictionary<object, object> connectionToGamer,
+            Action<object, byte[], byte> sendToClient)
+        {
+            try
+            {
+                object msg = DeserializeGameMessage("DNA.CastleMinerZ.Net.RequestPickupMessage", data);
+                if (msg == null)
+                    return;
+
+                int pickupId = Convert.ToInt32(GetMemberValue(msg, "PickupID"));
+                int spawnerId = Convert.ToInt32(GetMemberValue(msg, "SpawnerID"));
+
+                if (!_pendingPickupsById.TryGetValue(pickupId, out PendingPickup pending))
+                {
+                    _log($"[HostMsg] RequestPickupMessage from player {senderId} ignored; unknown pickupId={pickupId}, spawnerId={spawnerId}");
+                    return;
+                }
+
+
+                byte[] consumePayload = BuildConsumePickupMessagePayload(
+                    pending.PickupPositionBytes,
+                    pending.ItemBytes,
+                    pickupId,
+                    spawnerId,
+                    senderId,
+                    pending.DisplayOnPickup);
+
+                if (consumePayload == null || consumePayload.Length < 2)
+                {
+                    _log($"[HostMsg] Failed to build ConsumePickupMessage for pickupId={pickupId}");
+                    return;
+                }
+
+                bool sentToAnyone = false;
+
+                // Always send directly back to the requester first.
+                // This is the most reliable connection object we have, because the request arrived on it.
+                if (senderConn != null)
+                {
+                    _log($"[HostMsg] Sending ConsumePickupMessage pickupId={pickupId} directly to requester recipientId={senderId}");
+                    sendToClient(senderConn, consumePayload, senderId);
+                    sentToAnyone = true;
+                }
+
+                // Optionally fan out to any other connected peers so they also remove the pickup visually.
+                var liveConnections = connections as System.Collections.IEnumerable;
+                if (liveConnections != null)
+                {
+                    foreach (var conn in liveConnections)
+                    {
+                        if (ReferenceEquals(conn, senderConn))
+                            continue;
+
+                        if (!connectionToGamer.TryGetValue(conn, out var gamer))
+                            continue;
+
+                        byte recipientId = (byte)gamer.GetType().GetProperty("Id").GetValue(gamer);
+
+                        _log($"[HostMsg] Sending ConsumePickupMessage pickupId={pickupId} to recipientId={recipientId}");
+                        sendToClient(conn, consumePayload, recipientId);
+                        sentToAnyone = true;
+                    }
+                }
+
+                if (sentToAnyone)
+                {
+                    _pendingPickupsById.Remove(pickupId);
+                    _log($"[HostMsg] Resolved pickup pickupId={pickupId}, spawnerId={spawnerId}, picker={senderId}");
+                }
+                else
+                {
+                    _log($"[HostMsg] ConsumePickupMessage was built but not sent to any clients for pickupId={pickupId}");
+                }
+            }
+            catch (TargetInvocationException tie)
+            {
+                Exception inner = tie.InnerException ?? tie;
+                _log("ServerWorld HandleRequestPickupMessage inner: " + inner.GetType().FullName + ": " + inner.Message);
+            }
+            catch (Exception ex)
+            {
+                _log("ServerWorld HandleRequestPickupMessage: " + ex.GetType().FullName + ": " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// Builds a raw ConsumePickupMessage packet using the original reflected game message type.
+        ///
+        /// Notes:
+        /// - Reuses the game's protected SendData(BinaryWriter) implementation so the wire format stays exact.
+        /// - Packet layout emitted here is [msgId][payload...][checksum].
+        /// </summary>
+        private byte[] BuildConsumePickupMessagePayload(
+            byte[] pickupPositionBytes,
+            byte[] itemBytes,
+            int pickupId,
+            int spawnerId,
+            byte pickerUpper,
+            bool displayOnPickup)
+        {
+            const string fullTypeName = "DNA.CastleMinerZ.Net.ConsumePickupMessage";
+
+            try
+            {
+                if (!_typeToMessageId.TryGetValue(fullTypeName, out byte msgId))
+                {
+                    _log("ServerWorld: ConsumePickupMessage ID not found.");
+                    return null;
+                }
+
+                if (pickupPositionBytes == null || pickupPositionBytes.Length != 12)
+                {
+                    _log("ServerWorld: Invalid pickup position bytes for ConsumePickupMessage.");
+                    return null;
+                }
+
+                if (itemBytes == null)
+                    itemBytes = Array.Empty<byte>();
+
+                using (var ms = new MemoryStream())
+                using (var writer = new BinaryWriter(ms))
+                {
+                    writer.Write(msgId);
+
+                    // ConsumePickupMessage.SendData order:
+                    // PickupPosition
+                    // PickupID
+                    // SpawnerID
+                    // PickerUpper
+                    // DisplayOnPickup
+                    // Item.Write(writer)
+
+                    writer.Write(pickupPositionBytes);
+                    writer.Write(pickupId);
+                    writer.Write(spawnerId);
+                    writer.Write(pickerUpper);
+                    writer.Write(displayOnPickup);
+
+                    if (itemBytes.Length > 0)
+                        writer.Write(itemBytes);
+
+                    writer.Flush();
+
+                    int len = (int)ms.Position;
+                    writer.Write(XorChecksum(ms.GetBuffer(), 0, len));
+
+                    byte[] payload = ms.ToArray();
+                    _log($"[HostMsg] Built ConsumePickupMessage payload: pickupId={pickupId}, bytes={payload.Length}, spawnerId={spawnerId}, picker={pickerUpper}");
+                    return payload;
+                }
+            }
+            catch (Exception ex)
+            {
+                _log("ServerWorld BuildConsumePickupMessagePayload: " + ex.GetType().FullName + ": " + ex.Message);
+                return null;
+            }
+        }
+        #endregion
+
+        #endregion
+
+        #region Pending pickups
+
+        /// <summary>
+        /// Minimal host-side record for a spawned pickup that may later be claimed by RequestPickupMessage.
+        /// </summary>
+        private sealed class PendingPickup
+        {
+            public int PickupID;
+            public byte[] PickupPositionBytes; // 12 bytes.
+            public byte[] ItemBytes;           // Opaque raw InventoryItem bytes.
+            public bool DisplayOnPickup;
+        }
+
+        /// <summary>
+        /// Active pickup records keyed by pickup id.
+        ///
+        /// Notes:
+        /// - CreatePickupMessage does not carry SpawnerID, so the host tracks by PickupID.
+        /// - When RequestPickupMessage arrives, the host consumes the cached entry and broadcasts
+        ///   a ConsumePickupMessage back out to all clients.
+        /// </summary>
+        private readonly Dictionary<int, PendingPickup> _pendingPickupsById = new Dictionary<int, PendingPickup>();
 
         #endregion
 

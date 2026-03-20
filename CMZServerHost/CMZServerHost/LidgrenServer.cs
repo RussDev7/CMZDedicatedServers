@@ -169,6 +169,25 @@ namespace CMZServerHost
         /// </summary>
         private readonly int _viewRadiusChunks;
 
+        private CmzMessageCodec _codec;
+
+        /// <summary>
+        /// Cached raw PlayerExistsMessage payloads keyed by player id.
+        ///
+        /// Purpose:
+        /// - Makes player-presence recovery resilient if the original request/response
+        ///   exchange is missed or arrives before a client is fully ready.
+        /// - Allows the dedicated host to replay all known existing players back to a
+        ///   newly joined client once that client announces itself with requestResponse=true.
+        /// </summary>
+        private readonly Dictionary<byte, byte[]> _playerExistsPayloadById = new Dictionary<byte, byte[]>();
+
+        /// <summary>
+        /// Cached message id for DNA.CastleMinerZ.Net.PlayerExistsMessage.
+        /// Initialized lazily once the codec is ready.
+        /// </summary>
+        private byte? _playerExistsMessageId;
+
         #endregion
 
         #region Fields: Time Of Day Broadcast State
@@ -368,7 +387,14 @@ namespace CMZServerHost
 
             if (_worldHandler != null && _gameAsm != null)
             {
-                _worldHandler.Init(_gameAsm, _commonAsm);
+                if (_gameAsm == null)
+                    throw new InvalidOperationException("_gameAsm is null.");
+
+                if (_commonAsm == null)
+                    throw new InvalidOperationException("_commonAsm is null.");
+
+                _worldHandler?.Init(_gameAsm, _commonAsm);
+                _codec = new CmzMessageCodec(_gameAsm, _commonAsm, _log);
             }
 
             _running = true;
@@ -489,7 +515,11 @@ namespace CMZServerHost
                     if (payload != null && payload.Length > 0)
                     {
                         var reliableOrdered = Enum.Parse(_commonAsm.GetType("DNA.Net.Lidgren.NetDeliveryMethod"), "ReliableOrdered");
-                        foreach (var conn in (System.Collections.IEnumerable)_connections)
+                        var liveConnections = GetLiveConnections();
+                        if (liveConnections == null)
+                            return;
+
+                        foreach (var conn in liveConnections)
                         {
                             if (!_connectionToGamer.TryGetValue(conn, out var gamer))
                                 continue;
@@ -735,6 +765,15 @@ namespace CMZServerHost
             connType.GetMethod("Approve", Type.EmptyTypes).Invoke(senderConn, null);
             _log($"Connection approved from {gamer?.GetType().GetProperty("Gamertag")?.GetValue(gamer)}");
         }
+
+        private System.Collections.IEnumerable GetLiveConnections()
+        {
+            if (_netPeer == null)
+                return null;
+
+            var peerType = _netPeer.GetType();
+            return peerType.GetProperty("Connections")?.GetValue(_netPeer) as System.Collections.IEnumerable;
+        }
         #endregion
 
         #region Status / Join / Leave Handling
@@ -768,11 +807,14 @@ namespace CMZServerHost
                 var conn = msgType.GetProperty("SenderConnection").GetValue(msg);
                 if (conn != null && _connectionToGamer.TryGetValue(conn, out var disconnectedGamer))
                 {
+                    byte disconnectedId = (byte)disconnectedGamer.GetType().GetProperty("Id").GetValue(disconnectedGamer);
+
                     _connectionToGamer.Remove(conn);
                     _allGamers.Remove(disconnectedGamer);
+                    _playerExistsPayloadById.Remove(disconnectedId);
 
                     if (_worldHandler != null)
-                        _worldHandler.OnClientDisconnected((byte)disconnectedGamer.GetType().GetProperty("Id").GetValue(disconnectedGamer));
+                        _worldHandler.OnClientDisconnected(disconnectedId);
 
                     _log($"Player disconnected, {_allGamers.Count} remaining");
 
@@ -965,7 +1007,11 @@ namespace CMZServerHost
             _commonAsm.GetType("DNA.Net.Lidgren.NetConnection").GetProperty("Tag", BindingFlags.Public | BindingFlags.Instance)?.SetValue(senderConn, remoteGamer);
 
             // NewPeer: AddNewPeer uses ReadByte() for type then id — must write bytes, not int.
-            foreach (var conn in (System.Collections.IEnumerable)_connections)
+            var liveConnections = GetLiveConnections();
+            if (liveConnections == null)
+                return;
+
+            foreach (var conn in liveConnections)
             {
                 if (conn == senderConn)
                     continue;
@@ -1012,6 +1058,129 @@ namespace CMZServerHost
             else if (payload != null)
                 omType.GetMethod("Write", new[] { typeof(byte[]) })?.Invoke(om, new object[] { payload }); // wrong wire shape; last resort
         }
+
+        /// <summary>
+        /// Sends a raw CMZ inner payload to exactly one client using the standard channel-0 packet shape.
+        ///
+        /// Notes:
+        /// - recipientId is the local gamer id on the receiving client.
+        /// - senderId is the logical network sender id the client should see for the payload.
+        /// - This is used for replaying cached player-presence payloads with their original sender ids.
+        /// </summary>
+        private void SendChannel0PayloadToClient(object conn, byte recipientId, byte senderId, byte[] payload, object delivery = null)
+        {
+            if (_netPeer == null || conn == null || payload == null)
+                return;
+
+            var deliveryType = _commonAsm.GetType("DNA.Net.Lidgren.NetDeliveryMethod");
+            if (deliveryType == null)
+                return;
+
+            if (delivery == null)
+                delivery = Enum.Parse(deliveryType, "ReliableOrdered");
+
+            var peerType = _netPeer.GetType();
+            var om = peerType.GetMethod("CreateMessage", Type.EmptyTypes).Invoke(_netPeer, null);
+
+            WriteChannel0Packet(om, recipientId, senderId, payload);
+
+            conn.GetType()
+                .GetMethod("SendMessage", new[] { om.GetType(), deliveryType, typeof(int) })
+                ?.Invoke(conn, new[] { om, delivery, 0 });
+        }
+
+        /// <summary>
+        /// Returns true if the supplied CMZ payload is a PlayerExistsMessage.
+        ///
+        /// Notes:
+        /// - CMZ payload layout is [msgId][SendData body][checksum].
+        /// - For PlayerExistsMessage, the first body byte is RequestResponse.
+        /// </summary>
+        private bool TryParsePlayerExistsHeader(byte[] payload, out bool requestResponse)
+        {
+            requestResponse = false;
+
+            if (_codec == null || payload == null || payload.Length < 3)
+                return false;
+
+            try
+            {
+                if (!_playerExistsMessageId.HasValue)
+                    _playerExistsMessageId = _codec.GetMessageId("DNA.CastleMinerZ.Net.PlayerExistsMessage");
+
+                if (payload[0] != _playerExistsMessageId.Value)
+                    return false;
+
+                // PlayerExistsMessage.SendData writes RequestResponse first.
+                requestResponse = payload[1] != 0;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Replays all cached PlayerExistsMessage payloads for existing players to the specified joiner.
+        ///
+        /// Purpose:
+        /// - Allows a new client to reconstruct already-connected remote players even if the
+        ///   original request/response handshake was missed or raced during join.
+        /// </summary>
+        private void ReplayCachedPlayerExistsToJoiner(object joinerConn, byte joinerId)
+        {
+            if (joinerConn == null)
+                return;
+
+            foreach (var kv in _playerExistsPayloadById)
+            {
+                byte existingPlayerId = kv.Key;
+                byte[] payload = kv.Value;
+
+                if (existingPlayerId == joinerId)
+                    continue;
+
+                if (payload == null || payload.Length < 2)
+                    continue;
+
+                SendChannel0PayloadToClient(joinerConn, joinerId, existingPlayerId, payload);
+
+                _log($"Replayed cached PlayerExistsMessage: existing={existingPlayerId} -> joiner={joinerId}");
+            }
+        }
+
+        private void SendChannel0PayloadToAll(byte[] payload, byte senderId, byte? exceptPlayerId = null)
+        {
+            if (_netPeer == null || _connections == null || payload == null)
+                return;
+
+            var deliveryType = _commonAsm.GetType("DNA.Net.Lidgren.NetDeliveryMethod");
+            var reliableOrdered = Enum.Parse(deliveryType, "ReliableOrdered");
+            var peerType = _netPeer.GetType();
+
+            var liveConnections = GetLiveConnections();
+            if (liveConnections == null)
+                return;
+
+            foreach (var conn in liveConnections)
+            {
+                if (!_connectionToGamer.TryGetValue(conn, out var gamer))
+                    continue;
+
+                byte recipientId = (byte)gamer.GetType().GetProperty("Id").GetValue(gamer);
+
+                if (exceptPlayerId.HasValue && recipientId == exceptPlayerId.Value)
+                    continue;
+
+                var om = peerType.GetMethod("CreateMessage", Type.EmptyTypes).Invoke(_netPeer, null);
+                WriteChannel0Packet(om, recipientId, senderId, payload);
+
+                conn.GetType()
+                    .GetMethod("SendMessage", new[] { om.GetType(), deliveryType, typeof(int) })
+                    ?.Invoke(conn, new[] { om, reliableOrdered, 0 });
+            }
+        }
         #endregion
 
         #region Data Message Dispatch
@@ -1024,26 +1193,40 @@ namespace CMZServerHost
         /// - recipient X => direct peer relay
         ///
         /// Channel 1:
-        /// - internal/system packets, including world bootstrap/chunk requests
+        /// - internal wrapper packets used by the stock client for:
+        ///   - direct client -> peer sends via host (opcode 3)
+        ///   - client broadcast -> host -> all peers (opcode 4)
         ///
         /// Notes:
-        /// - Channel 1 uses a custom broadcast-to-host wrapper layout.
-        /// - Channel 0 uses the normal recipient/sender/byte-array payload layout.
+        /// - Channel 1 packets are wrapper packets, not raw gameplay payloads.
+        /// - The wrapped payload still needs to be forwarded to clients as a normal channel-0 packet.
         /// - Host-directed packets are offered to the world handler before any fallback relay occurs.
+        /// - PlayerExistsMessage payloads are cached so existing players can be replayed to newly joined clients.
         /// </summary>
         private void HandleDataMessage(object msg)
         {
             var msgType = msg.GetType();
             var seqChannel = msgType.GetProperty("SequenceChannel")?.GetValue(msg);
+            byte recipientId = 0;
+            System.Collections.IEnumerable liveConnections = GetLiveConnections();
 
-            #region Channel 1: Internal / System Packets
+            #region Channel 1: Internal / Wrapper Packets
 
             // ------------------------------------------------------------
             // CHANNEL 1
             // ------------------------------------------------------------
-            // Client -> host internal/system packets.
-            // Layout:
-            //   byte 4      = broadcast-to-host opcode
+            // Stock wrapper formats:
+            //
+            // Opcode 3 (direct proxy send):
+            //   byte 3
+            //   byte recipientId
+            //   byte flags
+            //   byte senderId
+            //   int  len
+            //   byte[len] payload
+            //
+            // Opcode 4 (broadcast-to-host):
+            //   byte 4
             //   byte flags
             //   byte senderId
             //   int  len
@@ -1054,46 +1237,113 @@ namespace CMZServerHost
                 var rb = msgType.GetMethod("ReadByte", Type.EmptyTypes);
                 var ri = msgType.GetMethod("ReadInt32", Type.EmptyTypes);
                 var rbytes = msgType.GetMethod("ReadBytes", new[] { typeof(int) });
+
                 if (rb == null || ri == null || rbytes == null)
                     return;
 
-                var b0 = (byte)rb.Invoke(msg, null);
-                if (b0 != 4)
-                    return; // Only handling host-directed internal broadcast packets here.
-
-                rb.Invoke(msg, null); // flags
-                var sndId = (byte)rb.Invoke(msg, null);
-                var dataSize = (int)ri.Invoke(msg, null);
-
-                byte[] payloadBytes =
-                    dataSize > 0
-                        ? rbytes.Invoke(msg, new object[] { dataSize }) as byte[]
-                        : System.Array.Empty<byte>();
-
-                if (payloadBytes == null || payloadBytes.Length < 1)
+                var deliveryType = _commonAsm.GetType("DNA.Net.Lidgren.NetDeliveryMethod");
+                if (deliveryType == null)
                     return;
 
-                var senderConn = msgType.GetProperty("SenderConnection")?.GetValue(msg);
-                if (senderConn == null || !_connectionToGamer.TryGetValue(senderConn, out _))
-                    return;
+                byte opcode = (byte)rb.Invoke(msg, null);
 
-                var delivery = Enum.Parse(_commonAsm.GetType("DNA.Net.Lidgren.NetDeliveryMethod"), "ReliableOrdered");
-
-                void SendToClient(object conn, byte[] payload, byte recipient)
+                // --------------------------------------------------------
+                // Opcode 3:
+                // client -> host wrapper for direct send to a specific peer
+                // --------------------------------------------------------
+                if (opcode == 3)
                 {
-                    var peerType = _netPeer.GetType();
-                    var om = peerType.GetMethod("CreateMessage", Type.EmptyTypes).Invoke(_netPeer, null);
-                    WriteChannel0Packet(om, recipient, 0, payload);
+                    recipientId = (byte)rb.Invoke(msg, null);
+                    object delivery = Enum.ToObject(deliveryType, (byte)rb.Invoke(msg, null));
+                    byte senderId = (byte)rb.Invoke(msg, null);
 
-                    conn.GetType()
-                        .GetMethod("SendMessage", new[] { om.GetType(), delivery.GetType(), typeof(int) })
-                        ?.Invoke(conn, new[] { om, delivery, 0 });
+                    int dataSize = (int)ri.Invoke(msg, null);
+                    byte[] payloadBytes =
+                        dataSize > 0
+                            ? rbytes.Invoke(msg, new object[] { dataSize }) as byte[]
+                            : Array.Empty<byte>();
+
+                    if (payloadBytes == null)
+                        return;
+
+                    var recipientConn = FindConnectionByPlayerId(recipientId);
+                    if (recipientConn == null)
+                        return;
+
+                    SendChannel0PayloadToClient(recipientConn, recipientId, senderId, payloadBytes, delivery);
+                    return;
                 }
 
-                // 1) Let world bootstrap / chunk logic consume it first.
-                if (_worldHandler != null &&
-                    _worldHandler.TryHandleHostMessage(0, sndId, payloadBytes, senderConn, _netPeer, _connections, _connectionToGamer, SendToClient))
+                // --------------------------------------------------------
+                // Opcode 4:
+                // client -> host broadcast wrapper, host may consume and/or relay
+                // --------------------------------------------------------
+                if (opcode == 4)
                 {
+                    object delivery = Enum.ToObject(deliveryType, (byte)rb.Invoke(msg, null));
+                    byte senderId = (byte)rb.Invoke(msg, null);
+
+                    int dataSize = (int)ri.Invoke(msg, null);
+                    byte[] payloadBytes =
+                        dataSize > 0
+                            ? rbytes.Invoke(msg, new object[] { dataSize }) as byte[]
+                            : Array.Empty<byte>();
+
+                    if (payloadBytes == null || payloadBytes.Length < 1)
+                        return;
+
+                    _log($"CH1 OP4 recv: sender={senderId}, payload={DescribeInnerPayload(payloadBytes)}, bytes={payloadBytes.Length}");
+
+                    var senderConn = msgType.GetProperty("SenderConnection")?.GetValue(msg);
+                    if (senderConn == null)
+                        return;
+
+                    bool isPlayerExists = TryParsePlayerExistsHeader(payloadBytes, out bool requestResponse);
+
+                    if (isPlayerExists)
+                    {
+                        _playerExistsPayloadById[senderId] = (byte[])payloadBytes.Clone();
+                        _log($"Cached PlayerExistsMessage for player {senderId}; requestResponse={requestResponse}");
+                    }
+
+                    void SendToClient(object conn, byte[] payload, byte recipient)
+                    {
+                        SendChannel0PayloadToClient(conn, recipient, 0, payload, Enum.Parse(deliveryType, "ReliableOrdered"));
+                    }
+
+                    // 1) Let authoritative host/world logic consume packets that should
+                    //    stay host-only (world info, chunk bootstrap, inventory, etc.).
+                    if (_worldHandler != null &&
+                        _worldHandler.TryHandleHostMessage(0, senderId, payloadBytes, senderConn, _netPeer, liveConnections, _connectionToGamer, SendToClient))
+                    {
+                        return;
+                    }
+
+                    // 2) If this was a PlayerExists(requestResponse=true), replay all known
+                    //    existing players back to the joining client before normal relay.
+                    if (isPlayerExists && requestResponse)
+                    {
+                        ReplayCachedPlayerExistsToJoiner(senderConn, senderId);
+                    }
+
+                    // 3) Relay the original payload to all peers except sender,
+                    //    preserving the original wrapped delivery flags.
+                    if (liveConnections == null)
+                        return;
+
+                    foreach (var conn in liveConnections)
+                    {
+                        if (!_connectionToGamer.TryGetValue(conn, out var gamer))
+                            continue;
+
+                        recipientId = (byte)gamer.GetType().GetProperty("Id").GetValue(gamer);
+
+                        if (recipientId == senderId)
+                            continue;
+
+                        SendChannel0PayloadToClient(conn, recipientId, senderId, payloadBytes, delivery);
+                    }
+
                     return;
                 }
 
@@ -1118,8 +1368,8 @@ namespace CMZServerHost
             if (readByte == null || readInt32 == null || readBytes == null)
                 return;
 
-            var recipientId = (byte)readByte.Invoke(msg, null);
-            var senderId = (byte)readByte.Invoke(msg, null);
+            recipientId = (byte)readByte.Invoke(msg, null);
+            var senderId0 = (byte)readByte.Invoke(msg, null);
 
             int len = (int)readInt32.Invoke(msg, null);
             byte[] data;
@@ -1133,6 +1383,8 @@ namespace CMZServerHost
             if (data == null || data.Length < 1)
                 return;
 
+            _log($"CH0 recv: recipient={recipientId}, sender={senderId0}, payload={DescribeInnerPayload(data)}, bytes={data.Length}");
+
             var reliableOrdered = Enum.Parse(_commonAsm.GetType("DNA.Net.Lidgren.NetDeliveryMethod"), "ReliableOrdered");
 
             // Host-directed packet:
@@ -1140,23 +1392,15 @@ namespace CMZServerHost
             if (recipientId == 0)
             {
                 var senderConn = msgType.GetProperty("SenderConnection")?.GetValue(msg);
-                if (senderConn != null && _connectionToGamer.TryGetValue(senderConn, out _))
+                if (senderConn != null)
                 {
                     void SendToClient(object conn, byte[] payload, byte recipient)
                     {
-                        var peerType = _netPeer.GetType();
-                        var om = peerType.GetMethod("CreateMessage", Type.EmptyTypes).Invoke(_netPeer, null);
-                        WriteChannel0Packet(om, recipient, 0, payload);
-
-                        var sendMsg = conn.GetType()
-                            .GetMethod("SendMessage", new[] { om.GetType(), reliableOrdered.GetType(), typeof(int) });
-
-                        sendMsg?.Invoke(conn, new[] { om, reliableOrdered, 0 });
+                        SendChannel0PayloadToClient(conn, recipient, 0, payload, reliableOrdered);
                     }
 
-                    // 1) world/chunk bootstrap
                     if (_worldHandler != null &&
-                        _worldHandler.TryHandleHostMessage(recipientId, senderId, data, senderConn, _netPeer, _connections, _connectionToGamer, SendToClient))
+                        _worldHandler.TryHandleHostMessage(recipientId, senderId0, data, senderConn, _netPeer, liveConnections, _connectionToGamer, SendToClient))
                     {
                         return;
                     }
@@ -1166,32 +1410,132 @@ namespace CMZServerHost
 
             #region Fallback Relay
 
-            // ------------------------------------------------------------
-            // FALLBACK RELAY
-            // ------------------------------------------------------------
-            foreach (var conn in (System.Collections.IEnumerable)_connections)
+            if (liveConnections == null)
+                return;
+
+            foreach (var conn in liveConnections)
             {
                 if (!_connectionToGamer.TryGetValue(conn, out var gamer))
                     continue;
 
                 var gamerId = (byte)gamer.GetType().GetProperty("Id").GetValue(gamer);
 
-                if (gamerId == senderId)
+                if (gamerId == senderId0)
                     continue;
 
                 if (recipientId != 0 && gamerId != recipientId)
                     continue;
 
-                var peerType = _netPeer.GetType();
-                var om = peerType.GetMethod("CreateMessage", Type.EmptyTypes).Invoke(_netPeer, null);
-
-                WriteChannel0Packet(om, gamerId, senderId, data);
-
-                conn.GetType()
-                    .GetMethod("SendMessage", new[] { om.GetType(), reliableOrdered.GetType(), typeof(int) })
-                    ?.Invoke(conn, new[] { om, reliableOrdered, 0 });
+                SendChannel0PayloadToClient(conn, gamerId, senderId0, data, reliableOrdered);
             }
             #endregion
+        }
+
+        private string DescribeInnerPayload(byte[] payload)
+        {
+            if (_codec == null || payload == null || payload.Length < 1)
+                return "<null>";
+
+            try
+            {
+                byte msgId = payload[0];
+                var field = typeof(CmzMessageCodec).GetField("_messageIdToType", BindingFlags.NonPublic | BindingFlags.Instance);
+                var map = field?.GetValue(_codec) as Dictionary<byte, string>;
+                if (map != null && map.TryGetValue(msgId, out var typeName))
+                    return $"{msgId}={typeName}";
+                return $"{msgId}=<unknown>";
+            }
+            catch
+            {
+                return "<decode failed>";
+            }
+        }
+        #endregion
+
+        #region General Send Helpers
+
+        private object FindConnectionByPlayerId(byte playerId)
+        {
+            var liveConnections = GetLiveConnections();
+            if (liveConnections == null)
+                return null;
+
+            foreach (var conn in liveConnections)
+            {
+                if (!_connectionToGamer.TryGetValue(conn, out var gamer))
+                    continue;
+
+                byte gid = (byte)gamer.GetType().GetProperty("Id").GetValue(gamer, null);
+                if (gid == playerId)
+                    return conn;
+            }
+
+            return null;
+        }
+
+        private void SendChannel0PayloadToConnection(object conn, byte recipientId, byte senderId, byte[] payload)
+        {
+            if (conn == null || payload == null || payload.Length == 0)
+                return;
+
+            var peerType = _netPeer.GetType();
+            var om = peerType.GetMethod("CreateMessage", Type.EmptyTypes).Invoke(_netPeer, null);
+
+            WriteChannel0Packet(om, recipientId, senderId, payload);
+
+            var deliveryType = _commonAsm.GetType("DNA.Net.Lidgren.NetDeliveryMethod");
+            var reliableOrdered = Enum.Parse(deliveryType, "ReliableOrdered");
+
+            var sendMethod = conn.GetType().GetMethod("SendMessage", new[] { om.GetType(), deliveryType, typeof(int) });
+            sendMethod?.Invoke(conn, new[] { om, reliableOrdered, 0 });
+        }
+
+        private void SendChannel0PayloadToPlayer(byte recipientId, byte senderId, byte[] payload)
+        {
+            var conn = FindConnectionByPlayerId(recipientId);
+            if (conn == null)
+                return;
+
+            SendChannel0PayloadToConnection(conn, recipientId, senderId, payload);
+        }
+
+        private void BroadcastChannel0Payload(byte senderId, byte[] payload, byte? excludePlayerId = null)
+        {
+            if (payload == null || payload.Length == 0)
+                return;
+
+            var liveConnections = GetLiveConnections();
+            if (liveConnections == null)
+                return;
+
+            foreach (var conn in liveConnections)
+            {
+                if (!_connectionToGamer.TryGetValue(conn, out var gamer))
+                    continue;
+
+                byte recipientId = (byte)gamer.GetType().GetProperty("Id").GetValue(gamer, null);
+
+                if (excludePlayerId.HasValue && recipientId == excludePlayerId.Value)
+                    continue;
+
+                SendChannel0PayloadToConnection(conn, recipientId, senderId, payload);
+            }
+        }
+        #endregion
+
+        #region Broadcast Relays
+
+        private void SendBroadcastText(string text)
+        {
+            byte[] payload = _codec.BuildPayload(
+                "DNA.CastleMinerZ.Net.BroadcastTextMessage",
+                msg =>
+                {
+                    _codec.SetMember(msg, "Message", text ?? string.Empty);
+                });
+
+            // SenderId = 0 because the dedicated server is acting as host.
+            BroadcastChannel0Payload(0, payload);
         }
         #endregion
     }
