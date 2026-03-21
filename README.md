@@ -204,17 +204,17 @@ On startup the server prints a summary similar to:
 ```text
 CMZ Server Host
 ---------------
-GameName       : CastleMinerZSteam
-NetworkVersion : 4
-Bind           : 0.0.0.0:61903
-ServerName     : CMZ Server
-MaxPlayers     : 8
-SteamUserId    : 76561198296842857
-WorldGuid      : ...
-WorldFolder    : Worlds\...
-WorldPath      : ...
-WorldInfo file : ...\world.info
-World loaded   : True
+GameName         : CastleMinerZSteam
+NetworkVersion   : 4
+Bind             : 0.0.0.0:61903
+ServerName       : CMZ Server
+MaxPlayers       : 8
+SaveOwnerSteamId : 76561198296842857
+WorldGuid        : ...
+WorldFolder      : Worlds\...
+WorldPath        : ...
+WorldInfo file   : ...\world.info
+World loaded     : True
 ```
 
 Then connect using the server IP and the configured `server-port`.
