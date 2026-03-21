@@ -46,6 +46,19 @@ namespace CMZServerHost
         /// </summary>
         public int NetworkVersion { get; private set; } = 4;
 
+        /// <summary>
+        /// Optional path to the CastleMiner Z game folder.
+        ///
+        /// Purpose:
+        /// - Lets the server load game assemblies from a custom location.
+        /// - Avoids requiring the files to be copied into a local "game" folder.
+        ///
+        /// Notes:
+        /// - Can be absolute or relative.
+        /// - If left empty, the server will fall back to ".\game".
+        /// </summary>
+        public string GamePath { get; private set; } = "";
+
         #endregion
 
         #region Bind / Session Limits
@@ -213,6 +226,13 @@ namespace CMZServerHost
                     cfg.BindAddress = ip;
                 }
             }
+            #endregion
+
+            #region Game path settings
+
+            if (map.TryGetValue("game-path", out var gamePath) && !string.IsNullOrWhiteSpace(gamePath))
+                cfg.GamePath = gamePath;
+
             #endregion
 
             #region Save / World Identity

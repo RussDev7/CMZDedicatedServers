@@ -49,9 +49,14 @@ namespace CMZServerHost
 
                 // Root folder for the current executable.
                 string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+                ServerConfig config = ServerConfig.Load(baseDir);
 
                 // Expected sub-folder containing CastleMinerZ.exe and companion assemblies.
-                string gamePath = Path.Combine(baseDir, "game");
+                string gamePath = string.IsNullOrWhiteSpace(config.GamePath)
+                    ? Path.Combine(baseDir, "game")
+                    : (Path.IsPathRooted(config.GamePath)
+                        ? config.GamePath
+                        : Path.GetFullPath(Path.Combine(baseDir, config.GamePath)));
 
                 #endregion
 
@@ -59,8 +64,8 @@ namespace CMZServerHost
 
                 if (!Directory.Exists(gamePath))
                 {
-                    Console.WriteLine("ERROR: Missing game folder.");
-                    Console.WriteLine("Expected: " + gamePath);
+                    Console.WriteLine("ERROR: Missing game folder / binaries path.");
+                    Console.WriteLine("Expected CastleMinerZ.exe under: " + gamePath);
                     return 1;
                 }
 
@@ -119,12 +124,6 @@ namespace CMZServerHost
                 // - Intentionally executed before server construction/startup.
                 // - Preserved exactly as-is.
                 ServerPatches.ApplyAllPatches();
-
-                #endregion
-
-                #region Load Configuration
-
-                ServerConfig config = ServerConfig.Load(baseDir);
 
                 #endregion
 
