@@ -195,7 +195,7 @@ namespace CMZServerHost
         /// <summary>
         /// Simulated time-of-day value broadcast to clients.
         /// </summary>
-        private float _timeOfDay;
+        private float _timeOfDay = 0.41f;
 
         /// <summary>
         /// Last time-of-day broadcast timestamp.
@@ -206,6 +206,15 @@ namespace CMZServerHost
 
         // 0..1 is a full day.
         private const float SecondsPerFullDay = 960f; // match GameScreen.LengthOfDay = 16 minutes
+
+        #endregion
+
+        #region Feilds: Gameplay sync settings
+
+        /// <summary>
+        /// Whether client-sent TimeOfDayMessage packets are allowed to update the server's authoritative day value.
+        /// </summary>
+        private readonly bool _allowClientTimeSync;
 
         #endregion
 
@@ -1369,6 +1378,13 @@ namespace CMZServerHost
 
                     _log($"CH1 OP4 recv: sender={senderId}, payload={DescribeInnerPayload(payloadBytes)}, bytes={payloadBytes.Length}");
 
+                    bool acceptedClientTimeSync = TryApplyIncomingTimeOfDay(senderId, payloadBytes);
+                    if (acceptedClientTimeSync)
+                    {
+                        // Optional: Force an immediate authoritative rebroadcast instead of waiting for the next timer tick.
+                        _lastTimeOfDaySend = DateTime.MinValue;
+                    }
+
                     var senderConn = msgType.GetProperty("SenderConnection")?.GetValue(msg);
                     if (senderConn == null)
                         return;
@@ -1523,6 +1539,46 @@ namespace CMZServerHost
             catch
             {
                 return "<decode failed>";
+            }
+        }
+        #endregion
+
+        #region Time sync helpers
+
+        /// <summary>
+        /// Attempts to apply an incoming TimeOfDayMessage payload to the server's authoritative day value.
+        ///
+        /// Purpose:
+        /// - Lets the server adopt a client-supplied day value when explicitly allowed.
+        /// - Keeps the dedicated server authoritative by updating _timeOfDay first, then letting the server
+        ///   continue broadcasting that value to all clients.
+        ///
+        /// Notes:
+        /// - Packet layout is [msgId][float dayValue][checksum].
+        /// - Returns true when the payload was recognized as a TimeOfDayMessage and successfully parsed.
+        /// </summary>
+        private bool TryApplyIncomingTimeOfDay(byte senderId, byte[] payload)
+        {
+            if (!_allowClientTimeSync || _codec == null || payload == null || payload.Length < 6)
+                return false;
+
+            try
+            {
+                byte msgId = payload[0];
+                string typeName = _codec.GetTypeName(msgId);
+                if (!string.Equals(typeName, "DNA.CastleMinerZ.Net.TimeOfDayMessage", StringComparison.Ordinal))
+                    return false;
+
+                float newDayValue = BitConverter.ToSingle(payload, 1);
+                _timeOfDay = newDayValue;
+
+                _log($"Accepted client TimeOfDayMessage from player {senderId}; server day set to {_timeOfDay:0.000}");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _log("TryApplyIncomingTimeOfDay failed: " + ex.GetType().FullName + ": " + ex.Message);
+                return false;
             }
         }
         #endregion

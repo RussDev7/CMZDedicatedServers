@@ -105,6 +105,23 @@ namespace CMZServerHost
         }
 
         /// <summary>
+        /// Gets the reflected full type name for a registered CMZ / DNA.Net message id.
+        ///
+        /// Purpose:
+        /// - Allows callers to identify an incoming payload by its message id.
+        /// - Provides the reverse lookup for _messageIdToType.
+        ///
+        /// Notes:
+        /// - Returns null if the message id is unknown.
+        /// </summary>
+        public string GetTypeName(byte messageId)
+        {
+            return _messageIdToType.TryGetValue(messageId, out var typeName)
+                ? typeName
+                : null;
+        }
+
+        /// <summary>
         /// Builds the raw inner payload used by CMZ messages:
         /// [msgId][message body][xor checksum]
         /// </summary>

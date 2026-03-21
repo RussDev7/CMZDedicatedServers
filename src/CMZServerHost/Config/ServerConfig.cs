@@ -138,6 +138,19 @@ namespace CMZServerHost
 
         #endregion
 
+        #region Gameplay sync settings
+
+        /// <summary>
+        /// Allows clients to submit TimeOfDayMessage values that update the server's authoritative day value.
+        ///
+        /// Notes:
+        /// - Disabled by default to avoid griefing / accidental time spam.
+        /// - When enabled, the server may accept incoming time sync packets from clients.
+        /// </summary>
+        public bool AllowClientTimeSync { get; private set; } = false;
+
+        #endregion
+
         #region Load
 
         /// <summary>
@@ -265,6 +278,13 @@ namespace CMZServerHost
 
             if (map.TryGetValue("difficulty", out var df) && int.TryParse(df, out var difficulty))
                 cfg.Difficulty = difficulty;
+
+            #endregion
+
+            #region Gameplay sync settings
+
+            if (map.TryGetValue("allow-client-time-sync", out var acts) && bool.TryParse(acts, out var allowClientTimeSync))
+                cfg.AllowClientTimeSync = allowClientTimeSync;
 
             #endregion
 
