@@ -33,6 +33,7 @@
   <ItemGroup>
     <None Update="Templates\server.properties">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>server.properties</TargetPath>
     </None>
   </ItemGroup>
 </Project>
