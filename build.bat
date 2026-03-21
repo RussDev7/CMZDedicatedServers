@@ -24,7 +24,7 @@ for /f "usebackq tokens=*" %%I in (`
 )
 
 Rem | Install SLN under x64 profile.
-"%MSBUILD%" ".\src\CMZServerHost.sln" /restore /p:Configuration=Release /p:Platform=x64
+"%MSBUILD%" ".\src\CMZServerHost.sln" /restore /p:Configuration=Release /p:Platform=x86
 
 Rem | Delete Paths & Create Paths
 if exist ".\release\" rmdir /s /q ".\release"
