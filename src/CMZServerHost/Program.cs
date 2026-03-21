@@ -161,17 +161,17 @@ namespace CMZServerHost
 
                 Console.WriteLine("CMZ Server Host");
                 Console.WriteLine("---------------");
-                Console.WriteLine($"GameName       : {config.GameName}");
-                Console.WriteLine($"NetworkVersion : {config.NetworkVersion}");
-                Console.WriteLine($"Bind           : {config.BindAddress}:{config.Port}");
-                Console.WriteLine($"ServerName     : {config.ServerName}");
-                Console.WriteLine($"MaxPlayers     : {config.MaxPlayers}");
-                Console.WriteLine($"SteamUserId    : {config.SteamUserId}");
-                Console.WriteLine($"WorldGuid      : {config.WorldGuid}");
-                Console.WriteLine($"WorldFolder    : {config.WorldFolder}");
-                Console.WriteLine($"WorldPath      : {config.WorldPath}");
-                Console.WriteLine($"WorldInfo file : {Path.Combine(config.WorldPath, "world.info")}");
-                Console.WriteLine($"World loaded   : {File.Exists(Path.Combine(config.WorldPath, "world.info"))}");
+                Console.WriteLine($"GameName         : {config.GameName}");
+                Console.WriteLine($"NetworkVersion   : {config.NetworkVersion}");
+                Console.WriteLine($"Bind             : {config.BindAddress}:{config.Port}");
+                Console.WriteLine($"ServerName       : {config.ServerName}");
+                Console.WriteLine($"MaxPlayers       : {config.MaxPlayers}");
+                Console.WriteLine($"SaveOwnerSteamId : {config.SaveOwnerSteamId}");
+                Console.WriteLine($"WorldGuid        : {config.WorldGuid}");
+                Console.WriteLine($"WorldFolder      : {config.WorldFolder}");
+                Console.WriteLine($"WorldPath        : {config.WorldPath}");
+                Console.WriteLine($"WorldInfo file   : {Path.Combine(config.WorldPath, "world.info")}");
+                Console.WriteLine($"World loaded     : {File.Exists(Path.Combine(config.WorldPath, "world.info"))}");
                 Console.WriteLine();
 
                 #endregion
@@ -194,7 +194,7 @@ namespace CMZServerHost
                     gameAsm: gameAsm,
                     worldFolder: string.IsNullOrWhiteSpace(config.WorldFolder) ? null : config.WorldFolder,
                     saveRoot: baseDir,
-                    steamUserId: config.SteamUserId,
+                    saveOwnerSteamId: config.SaveOwnerSteamId,
                     bindAddress: config.BindAddress,
                     viewRadiusChunks: config.ViewDistanceChunks,
                     serverName: config.ServerName,

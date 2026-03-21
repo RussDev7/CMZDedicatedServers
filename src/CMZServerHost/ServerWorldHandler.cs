@@ -4,13 +4,12 @@ Copyright (c) 2025 RussDev7, unknowghost0
 This file is part of https://github.com/RussDev7/CMZDedicatedServer - see LICENSE for details.
 */
 
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Collections.Generic;
+using System.Reflection;
 using System.Text;
+using System.IO;
+using System;
 
 namespace CMZServerHost
 {
@@ -43,7 +42,7 @@ namespace CMZServerHost
         private readonly string _saveRoot;
 
         /// <summary>Steam user id used to derive the save-device encryption key.</summary>
-        private readonly ulong _steamUserId;
+        private readonly ulong _saveOwnerSteamId;
 
         /// <summary>Absolute game path used externally by the host application.</summary>
         private readonly string _gamePath;
@@ -136,14 +135,14 @@ namespace CMZServerHost
             string gamePath,
             string worldFolder,
             string saveRoot,
-            ulong steamUserId,
+            ulong saveOwnerSteamId,
             Action<string> log,
             int viewRadiusChunks = 8)
         {
             _gamePath = gamePath ?? throw new ArgumentNullException(nameof(gamePath));
             _worldFolder = worldFolder ?? throw new ArgumentNullException(nameof(worldFolder));
             _saveRoot = saveRoot ?? throw new ArgumentNullException(nameof(saveRoot));
-            _steamUserId = steamUserId;
+            _saveOwnerSteamId = saveOwnerSteamId;
             _log = log ?? (_ => { });
             _viewRadiusChunks = viewRadiusChunks < 2 ? 2 : (viewRadiusChunks > 32 ? 32 : viewRadiusChunks);
         }
@@ -2301,9 +2300,9 @@ namespace CMZServerHost
         {
             try
             {
-                if (_steamUserId == 0UL)
+                if (_saveOwnerSteamId == 0UL)
                 {
-                    _log("ServerWorld: steam-user-id is required.");
+                    _log("ServerWorld: save-owner-steam-id is required.");
                     return;
                 }
 
@@ -2323,7 +2322,7 @@ namespace CMZServerHost
                 }
 
                 object md5 = Activator.CreateInstance(md5Type);
-                byte[] sourceBytes = Encoding.UTF8.GetBytes(_steamUserId.ToString() + "CMZ778");
+                byte[] sourceBytes = Encoding.UTF8.GetBytes(_saveOwnerSteamId.ToString() + "CMZ778");
 
                 MethodInfo computeMethod = md5Type.GetMethod("Compute", new[] { typeof(byte[]) });
                 if (computeMethod == null)

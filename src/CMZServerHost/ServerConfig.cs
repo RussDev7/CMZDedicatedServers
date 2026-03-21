@@ -86,7 +86,7 @@ namespace CMZServerHost
         /// <summary>
         /// Steam user id used for save-device key derivation and storage access.
         /// </summary>
-        public ulong SteamUserId { get; private set; } = 0UL;
+        public ulong SaveOwnerSteamId { get; private set; } = 0UL;
 
         /// <summary>
         /// World GUID string loaded from configuration.
@@ -237,8 +237,8 @@ namespace CMZServerHost
 
             #region Save / World Identity
 
-            if (map.TryGetValue("steam-user-id", out var suid) && ulong.TryParse(suid, out var steamUserId))
-                cfg.SteamUserId = steamUserId;
+            if (map.TryGetValue("save-owner-steam-id", out var suid) && ulong.TryParse(suid, out var saveOwnerSteamId))
+                cfg.SaveOwnerSteamId = saveOwnerSteamId;
 
             if (map.TryGetValue("world-guid", out var worldGuid) && !string.IsNullOrWhiteSpace(worldGuid))
                 cfg.WorldGuid = worldGuid;

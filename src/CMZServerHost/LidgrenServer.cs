@@ -59,7 +59,7 @@ namespace CMZServerHost
         /// <summary>
         /// Steam user id used for save-device compatibility / encryption key derivation.
         /// </summary>
-        private readonly ulong _steamUserId;
+        private readonly ulong _saveOwnerSteamId;
 
         #endregion
 
@@ -232,7 +232,7 @@ namespace CMZServerHost
         /// - Optionally prepares the world handler if enough save/world info is supplied.
         ///
         /// Notes:
-        /// - The world handler is only created when gameAsm, worldFolder, saveRoot, and steamUserId are all available.
+        /// - The world handler is only created when gameAsm, worldFolder, saveRoot, and saveOwnerSteamId are all available.
         /// - gameName defaults to "CastleMinerZSteam".
         /// - networkVersion defaults to 4.
         /// </summary>
@@ -244,7 +244,7 @@ namespace CMZServerHost
             Assembly gameAsm = null,
             string worldFolder = null,
             string saveRoot = null,
-            ulong steamUserId = 0UL,
+            ulong saveOwnerSteamId = 0UL,
             IPAddress bindAddress = null,
             int viewRadiusChunks = 8,
             string serverName = null,
@@ -267,7 +267,7 @@ namespace CMZServerHost
 
             _worldFolder = worldFolder;
             _saveRoot = saveRoot;
-            _steamUserId = steamUserId;
+            _saveOwnerSteamId = saveOwnerSteamId;
 
             _viewRadiusChunks = viewRadiusChunks;
             _gameName = string.IsNullOrWhiteSpace(gameName) ? "CastleMinerZSteam" : gameName;
@@ -276,13 +276,13 @@ namespace CMZServerHost
             if (_gameAsm != null &&
                 !string.IsNullOrWhiteSpace(_worldFolder) &&
                 !string.IsNullOrWhiteSpace(_saveRoot) &&
-                _steamUserId != 0UL)
+                _saveOwnerSteamId != 0UL)
             {
                 _worldHandler = new ServerWorldHandler(
                     _gamePath,
                     _worldFolder,   // relative, e.g. Worlds\{guid}
                     _saveRoot,      // absolute server root
-                    _steamUserId,
+                    _saveOwnerSteamId,
                     _log,
                     _viewRadiusChunks);
             }
