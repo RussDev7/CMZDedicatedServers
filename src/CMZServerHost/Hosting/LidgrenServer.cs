@@ -826,6 +826,64 @@ namespace CMZServerHost
                 {
                     byte disconnectedId = (byte)disconnectedGamer.GetType().GetProperty("Id").GetValue(disconnectedGamer);
 
+                    // Notify remaining clients to remove this peer from their session/player state.
+                    try
+                    {
+                        var dropPeerHostPeerType = _netPeer.GetType();
+                        var dropPeerDelivery = Enum.Parse(_commonAsm.GetType("DNA.Net.Lidgren.NetDeliveryMethod"), "ReliableOrdered");
+                        var dropPeerConnections = GetLiveConnections();
+
+                        var dropPeerNetBufferType = _commonAsm.GetType("DNA.Net.Lidgren.NetBuffer");
+                        var dropPeerMsgType = _commonAsm.GetType("DNA.Net.GamerServices.DropPeerMessage");
+                        var dropPeerLidgrenExt = _commonAsm.GetType("DNA.Net.GamerServices.LidgrenExtensions");
+                        var writeDropPeer = dropPeerLidgrenExt?.GetMethod(
+                            "Write",
+                            BindingFlags.Public | BindingFlags.Static,
+                            null,
+                            new[] { dropPeerNetBufferType, dropPeerMsgType },
+                            null);
+
+                        if (dropPeerMsgType != null && writeDropPeer != null && dropPeerConnections != null)
+                        {
+                            object dropPeer = Activator.CreateInstance(dropPeerMsgType);
+                            dropPeerMsgType.GetField("PlayerGID")?.SetValue(dropPeer, disconnectedId);
+
+                            foreach (var otherConn in dropPeerConnections)
+                            {
+                                if (otherConn == null || ReferenceEquals(otherConn, conn))
+                                    continue;
+
+                                if (!_connectionToGamer.TryGetValue(otherConn, out _))
+                                    continue;
+
+                                var om = dropPeerHostPeerType.GetMethod("CreateMessage", Type.EmptyTypes).Invoke(_netPeer, null);
+                                var omType = om.GetType();
+
+                                // Internal session/system message type 2 = DropPeer
+                                omType.GetMethod("Write", new[] { typeof(byte) }).Invoke(om, new object[] { (byte)2 });
+                                writeDropPeer.Invoke(null, new object[] { om, dropPeer });
+
+                                otherConn.GetType()
+                                    .GetMethod("SendMessage", new[] { om.GetType(), dropPeerDelivery.GetType(), typeof(int) })
+                                    ?.Invoke(otherConn, new[] { om, dropPeerDelivery, 1 });
+
+                                if (_connectionToGamer.TryGetValue(otherConn, out var otherGamer))
+                                {
+                                    byte otherId = (byte)otherGamer.GetType().GetProperty("Id").GetValue(otherGamer);
+                                    _log($"Sent DropPeer for player {disconnectedId} to recipient {otherId}.");
+                                }
+                            }
+                        }
+                        else
+                        {
+                            _log($"DropPeer broadcast skipped for player {disconnectedId} (missing reflected type/method or live connections).");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _log($"Broadcast DropPeer failed: {ex.GetType().FullName}: {ex.Message}.");
+                    }
+
                     _connectionToGamer.Remove(conn);
                     _allGamers.Remove(disconnectedGamer);
                     _playerExistsPayloadById.Remove(disconnectedId);
@@ -833,7 +891,7 @@ namespace CMZServerHost
                     if (_worldHandler != null)
                         _worldHandler.OnClientDisconnected(disconnectedId);
 
-                    _log($"Player disconnected, {_allGamers.Count} remaining");
+                    _log($"Player disconnected: id={disconnectedId}, {_allGamers.Count} remaining.");
 
                     if (_allGamers.Count == 0)
                         _nextPlayerGid = 1;

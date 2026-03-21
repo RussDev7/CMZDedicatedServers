@@ -1,36 +1,37 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net481</TargetFramework>
     <PlatformTarget>x86</PlatformTarget>
     <AssemblyName>CMZServerHost</AssemblyName>
     <RootNamespace>CMZServerHost</RootNamespace>
-    <OutputPath>build\ServerHost\</OutputPath>
+    <OutputPath>Build\ServerHost\</OutputPath>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <LangVersion>latest</LangVersion>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <DebugSymbols>false</DebugSymbols>
     <DebugType>none</DebugType>
+    <GenerateSupportedRuntime>false</GenerateSupportedRuntime>
   </PropertyGroup>
 
   <ItemGroup>
     <Reference Include="0Harmony">
-      <HintPath>lib\0Harmony.dll</HintPath>
+      <HintPath>Libs\0Harmony.dll</HintPath>
       <Private>false</Private>
     </Reference>
   </ItemGroup>
-
+  
   <ItemGroup>
-    <Content Include="lib\0Harmony.dll">
+    <Content Include="Libs\0Harmony.dll">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Link>libs\0Harmony.dll</Link>
+      <Link>Libs\0Harmony.dll</Link>
       <TargetPath>Libs\0Harmony.dll</TargetPath>
     </Content>
   </ItemGroup>
 
   <ItemGroup>
-    <None Include="server.properties">
+    <None Update="Templates\server.properties">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
   </ItemGroup>
