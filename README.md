@@ -44,7 +44,7 @@ CMZDedicatedServer-main/
          └─ ServerHost/
             ├─ CMZServerHost.exe
             ├─ server.properties
-            ├─ libs/
+            ├─ Libs/
             │  └─ 0Harmony.dll
             └─ Game/
                ├─ CastleMinerZ.exe
