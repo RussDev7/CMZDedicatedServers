@@ -58,6 +58,12 @@ namespace CMZServerHost
                         ? config.GamePath
                         : Path.GetFullPath(Path.Combine(baseDir, config.GamePath)));
 
+                /// <summary>
+                /// Resolves the local support-library folder used for non-game assemblies,
+                /// such as Harmony, that do not need to live beside the executable.
+                /// </summary>
+                string libsPath = Path.Combine(baseDir, "libs");
+
                 #endregion
 
                 #region Validate Required Game Folder / Executable
@@ -77,30 +83,54 @@ namespace CMZServerHost
                     Console.WriteLine("ERROR: Missing CastleMinerZ.exe");
                     return 2;
                 }
+
+                /// <summary>
+                /// Optional validation for support libraries required by the server host.
+                ///
+                /// Purpose:
+                /// - Fails early with a clear message if Harmony is missing from the libs folder.
+                /// </summary>
+                string harmonyPath = Path.Combine(libsPath, "0Harmony.dll");
+                if (!File.Exists(harmonyPath))
+                {
+                    Console.WriteLine("ERROR: Missing 0Harmony.dll");
+                    Console.WriteLine("Expected: " + harmonyPath);
+                    return 3;
+                }
                 #endregion
 
                 #region Assembly Resolution
 
                 /// <summary>
-                /// Resolves missing dependent assemblies from the local "game" folder.
+                /// Resolves missing dependent assemblies from known local folders.
+                ///
+                /// Purpose:
+                /// - Probes the support-library folder first (for things like Harmony).
+                /// - Then probes the CastleMiner Z game folder for reflected runtime dependencies.
                 ///
                 /// Notes:
                 /// - First checks for a matching DLL.
-                /// - Then checks for a matching EXE assembly.
-                /// - Returns null when the requested assembly cannot be resolved here,
-                ///   allowing normal resolution to continue/fail naturally.
+                /// - Then checks for a matching EXE assembly in the game folder.
+                /// - Returns null when the requested assembly cannot be resolved here.
                 /// </summary>
                 AppDomain.CurrentDomain.AssemblyResolve += (sender, resolveArgs) =>
                 {
                     var asmName = new AssemblyName(resolveArgs.Name);
 
-                    string dllPath = Path.Combine(gamePath, asmName.Name + ".dll");
-                    if (File.Exists(dllPath))
-                        return Assembly.LoadFrom(dllPath);
+                    // 1) Support libraries beside the server, but inside /libs.
+                    string libsDllPath = Path.Combine(libsPath, asmName.Name + ".dll");
+                    if (File.Exists(libsDllPath))
+                        return Assembly.LoadFrom(libsDllPath);
 
-                    string exeAsmPath = Path.Combine(gamePath, asmName.Name + ".exe");
-                    if (File.Exists(exeAsmPath))
-                        return Assembly.LoadFrom(exeAsmPath);
+                    // 2) Game folder DLLs.
+                    string gameDllPath = Path.Combine(gamePath, asmName.Name + ".dll");
+                    if (File.Exists(gameDllPath))
+                        return Assembly.LoadFrom(gameDllPath);
+
+                    // 3) Game folder EXE assemblies.
+                    string gameExeAsmPath = Path.Combine(gamePath, asmName.Name + ".exe");
+                    if (File.Exists(gameExeAsmPath))
+                        return Assembly.LoadFrom(gameExeAsmPath);
 
                     return null;
                 };

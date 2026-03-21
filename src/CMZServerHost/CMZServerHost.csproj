@@ -15,8 +15,16 @@
   <ItemGroup>
     <Reference Include="0Harmony">
       <HintPath>lib\0Harmony.dll</HintPath>
-      <Private>true</Private>
+      <Private>false</Private>
     </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="lib\0Harmony.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>libs\0Harmony.dll</Link>
+      <TargetPath>Libs\0Harmony.dll</TargetPath>
+    </Content>
   </ItemGroup>
 
   <ItemGroup>
