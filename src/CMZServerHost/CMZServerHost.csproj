@@ -35,5 +35,21 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <TargetPath>server.properties</TargetPath>
     </None>
+    <None Update="Templates\banned-ip.txt">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>banned-ip.txt</TargetPath>
+    </None>
+    <None Update="Templates\banned-user.txt">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>banned-user.txt</TargetPath>
+    </None>
+    <None Update="Templates\whitelist.txt">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>whitelist.txt</TargetPath>
+    </None>
+    <None Update="Templates\plugins\README.txt">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>plugins\README.txt</TargetPath>
+    </None>
   </ItemGroup>
 </Project>

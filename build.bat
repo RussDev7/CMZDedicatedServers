@@ -26,6 +26,12 @@ for /f "usebackq tokens=*" %%I in (`
 Rem | Install SLN under x64 profile.
 "%MSBUILD%" ".\src\CMZServerHost.sln" /restore /p:Configuration=Release /p:Platform=x86
 
+Rem | Stop running server host so release files are not locked.
+taskkill /IM "CMZServerHost.exe" /F >nul 2>&1
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$pattern = [regex]::Escape('CMZServerHost-' + $env:VersionPrefix);" ^
+  "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'cmd.exe' -and $_.CommandLine -match $pattern } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
+
 Rem | Delete Paths & Create Paths
 if exist ".\release\" rmdir /s /q ".\release"
 mkdir ".\release"

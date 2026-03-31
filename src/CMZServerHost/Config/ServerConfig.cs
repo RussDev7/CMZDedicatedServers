@@ -149,6 +149,11 @@ namespace CMZServerHost
         /// </summary>
         public bool AllowClientTimeSync { get; private set; } = false;
 
+        /// <summary>
+        /// When enabled, only usernames listed in whitelist.txt may join.
+        /// </summary>
+        public bool WhitelistEnabled { get; private set; } = false;
+
         #endregion
 
         #region Load
@@ -285,6 +290,13 @@ namespace CMZServerHost
 
             if (map.TryGetValue("allow-client-time-sync", out var acts) && bool.TryParse(acts, out var allowClientTimeSync))
                 cfg.AllowClientTimeSync = allowClientTimeSync;
+
+            #endregion
+
+            #region Whitelist settings
+
+            if (map.TryGetValue("whitelist", out var whitelistEnabled) && bool.TryParse(whitelistEnabled, out var whitelistEnabledValue))
+                cfg.WhitelistEnabled = whitelistEnabledValue;
 
             #endregion
 

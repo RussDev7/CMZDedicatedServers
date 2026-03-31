@@ -64,6 +64,12 @@ namespace CMZServerHost
                 /// </summary>
                 string libsPath = Path.Combine(baseDir, "libs");
 
+                /// <summary>
+                /// Folder used for optional server plugins.
+                /// </summary>
+                string pluginsPath = Path.Combine(baseDir, "plugins");
+                Directory.CreateDirectory(pluginsPath);
+
                 #endregion
 
                 #region Validate Required Game Folder / Executable
@@ -127,7 +133,12 @@ namespace CMZServerHost
                     if (File.Exists(gameDllPath))
                         return Assembly.LoadFrom(gameDllPath);
 
-                    // 3) Game folder EXE assemblies.
+                    // 3) Plugin DLLs beside the server.
+                    string pluginDllPath = Path.Combine(pluginsPath, asmName.Name + ".dll");
+                    if (File.Exists(pluginDllPath))
+                        return Assembly.LoadFrom(pluginDllPath);
+
+                    // 4) Game folder EXE assemblies.
                     string gameExeAsmPath = Path.Combine(gamePath, asmName.Name + ".exe");
                     if (File.Exists(gameExeAsmPath))
                         return Assembly.LoadFrom(gameExeAsmPath);
@@ -144,6 +155,9 @@ namespace CMZServerHost
                 // Optional shared/common assembly used by parts of the host/runtime.
                 Assembly commonAsm = File.Exists(commonPath) ? Assembly.LoadFrom(commonPath) : null;
 
+                // Optional plugin assemblies loaded from /plugins.
+                int loadedPluginCount = LoadPluginAssemblies(pluginsPath);
+
                 #endregion
 
                 #region Apply Runtime Patches
@@ -159,19 +173,50 @@ namespace CMZServerHost
 
                 #region Print Startup Summary
 
+                bool worldLoaded = File.Exists(Path.Combine(config.WorldPath, "world.info"));
+                string bannedUsersPath = Path.Combine(baseDir, "banned-user.txt");
+                int bannedUserCount = 0;
+                string whitelistPath = Path.Combine(baseDir, "whitelist.txt");
+                int whitelistUserCount = 0;
+
+                if (File.Exists(bannedUsersPath))
+                {
+                    foreach (string rawLine in File.ReadLines(bannedUsersPath))
+                    {
+                        string line = (rawLine ?? string.Empty).Trim();
+                        if (line.Length == 0 || line.StartsWith("#", StringComparison.Ordinal))
+                            continue;
+
+                        bannedUserCount++;
+                    }
+                }
+
+                if (config.WhitelistEnabled && File.Exists(whitelistPath))
+                {
+                    foreach (string rawLine in File.ReadLines(whitelistPath))
+                    {
+                        string line = (rawLine ?? string.Empty).Trim();
+                        if (line.Length == 0 || line.StartsWith("#", StringComparison.Ordinal))
+                            continue;
+
+                        whitelistUserCount++;
+                    }
+                }
+
                 Console.WriteLine("CMZ Server Host");
                 Console.WriteLine("---------------");
-                Console.WriteLine($"GameName         : {config.GameName}");
+                Console.WriteLine("GameName         : CastleMiner Z");
                 Console.WriteLine($"NetworkVersion   : {config.NetworkVersion}");
                 Console.WriteLine($"Bind             : {config.BindAddress}:{config.Port}");
                 Console.WriteLine($"ServerName       : {config.ServerName}");
                 Console.WriteLine($"MaxPlayers       : {config.MaxPlayers}");
-                Console.WriteLine($"SaveOwnerSteamId : {config.SaveOwnerSteamId}");
-                Console.WriteLine($"WorldGuid        : {config.WorldGuid}");
-                Console.WriteLine($"WorldFolder      : {config.WorldFolder}");
-                Console.WriteLine($"WorldPath        : {config.WorldPath}");
-                Console.WriteLine($"WorldInfo file   : {Path.Combine(config.WorldPath, "world.info")}");
-                Console.WriteLine($"World loaded     : {File.Exists(Path.Combine(config.WorldPath, "world.info"))}");
+                Console.WriteLine("WorldFolder      : Worlds");
+                Console.WriteLine("WorldInfo file   : world.info");
+                Console.WriteLine($"World loaded     : {(worldLoaded ? "Successfully" : "Missing")}");
+                Console.WriteLine($"Banned           : {bannedUserCount}");
+                Console.WriteLine($"Plugin loaded    : {loadedPluginCount}");
+                if (config.WhitelistEnabled)
+                    Console.WriteLine($"Whitelist        : {whitelistUserCount}");
                 Console.WriteLine();
 
                 #endregion
@@ -190,7 +235,7 @@ namespace CMZServerHost
                     gamePath: gamePath,
                     port: config.Port,
                     maxPlayers: config.MaxPlayers,
-                    log: Console.WriteLine,
+                    log: _ => { },
                     gameAsm: gameAsm,
                     worldFolder: string.IsNullOrWhiteSpace(config.WorldFolder) ? null : config.WorldFolder,
                     saveRoot: baseDir,
@@ -201,6 +246,8 @@ namespace CMZServerHost
                     gameMode: config.GameMode,
                     pvpState: config.PvpState,
                     difficulty: config.Difficulty,
+                    allowClientTimeSync: config.AllowClientTimeSync,
+                    whitelistEnabled: config.WhitelistEnabled,
                     gameName: config.GameName,
                     networkVersion: config.NetworkVersion);
 
@@ -209,11 +256,7 @@ namespace CMZServerHost
                 #region Start Server
 
                 server.Start();
-
-                Console.WriteLine();
                 Console.WriteLine("Server started.");
-                Console.WriteLine($"Local test target: 127.0.0.1:{config.Port}");
-                Console.WriteLine("Press Ctrl+C to stop.");
 
                 #endregion
 
@@ -231,7 +274,6 @@ namespace CMZServerHost
                 Console.CancelKeyPress += (s, e) =>
                 {
                     e.Cancel = true;
-                    running = false;
                 };
                 #endregion
 
@@ -299,5 +341,30 @@ namespace CMZServerHost
             }
         }
         #endregion
+
+        private static int LoadPluginAssemblies(string pluginsPath)
+        {
+            if (string.IsNullOrWhiteSpace(pluginsPath) || !Directory.Exists(pluginsPath))
+                return 0;
+
+            string[] pluginFiles = Directory.GetFiles(pluginsPath, "*.dll", SearchOption.TopDirectoryOnly);
+            if (pluginFiles.Length == 0)
+                return 0;
+
+            int loadedPluginCount = 0;
+            foreach (string pluginFile in pluginFiles)
+            {
+                try
+                {
+                    Assembly.LoadFrom(pluginFile);
+                    loadedPluginCount++;
+                }
+                catch
+                {
+                }
+            }
+
+            return loadedPluginCount;
+        }
     }
 }

@@ -1,0 +1,2 @@
+# One user name per line.
+# Matches gamertag or display name.

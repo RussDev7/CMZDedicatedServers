@@ -110,6 +110,23 @@ namespace CMZServerHost
         /// </summary>
         private readonly Action<string> _log;
 
+        /// <summary>
+        /// Text file containing one banned IP address per line.
+        /// </summary>
+        private readonly string _bannedIpFilePath;
+
+        /// <summary>
+        /// Text file containing one banned user name per line.
+        /// Matches either gamertag or display name.
+        /// </summary>
+        private readonly string _bannedUserFilePath;
+
+        /// <summary>
+        /// Text file containing one whitelisted user name per line.
+        /// Matches either gamertag or display name.
+        /// </summary>
+        private readonly string _whitelistFilePath;
+
         #endregion
 
         #region Fields: Networking Runtime State
@@ -216,6 +233,11 @@ namespace CMZServerHost
         /// </summary>
         private readonly bool _allowClientTimeSync;
 
+        /// <summary>
+        /// When true, only usernames present in whitelist.txt may join.
+        /// </summary>
+        private readonly bool _whitelistEnabled;
+
         #endregion
 
         #region Properties
@@ -260,6 +282,8 @@ namespace CMZServerHost
             int gameMode = 1,
             int pvpState = 0,
             int difficulty = 1,
+            bool allowClientTimeSync = false,
+            bool whitelistEnabled = false,
             string gameName = "CastleMinerZSteam",
             int networkVersion = 4)
         {
@@ -281,6 +305,17 @@ namespace CMZServerHost
             _viewRadiusChunks = viewRadiusChunks;
             _gameName = string.IsNullOrWhiteSpace(gameName) ? "CastleMinerZSteam" : gameName;
             _networkVersion = networkVersion > 0 ? networkVersion : 4;
+            _allowClientTimeSync = allowClientTimeSync;
+            _whitelistEnabled = whitelistEnabled;
+
+            string serverRoot = string.IsNullOrWhiteSpace(_saveRoot)
+                ? AppDomain.CurrentDomain.BaseDirectory
+                : _saveRoot;
+            _bannedIpFilePath = Path.Combine(serverRoot, "banned-ip.txt");
+            _bannedUserFilePath = Path.Combine(serverRoot, "banned-user.txt");
+            _whitelistFilePath = Path.Combine(serverRoot, "whitelist.txt");
+            EnsureBanFilesExist();
+            EnsureWhitelistFileExists();
 
             if (_gameAsm != null &&
                 !string.IsNullOrWhiteSpace(_worldFolder) &&
@@ -769,11 +804,43 @@ namespace CMZServerHost
             }
 
             var gamerType = gamer.GetType();
-            var gamerTag = gamerType.GetProperty("Gamertag")?.GetValue(gamer);
-            var displayName = gamerType.GetProperty("DisplayName")?.GetValue(gamer);
+            var gamerTag = gamerType.GetProperty("Gamertag")?.GetValue(gamer) as string;
+            var displayName = gamerType.GetProperty("DisplayName")?.GetValue(gamer) as string;
             _log($"ConnectionApproval: Gamer object received. Gamertag: {gamerTag}, DisplayName: {displayName}");
 
-            if (gamerTag as string == "unknow ghost")
+            string remoteIp = TryGetRemoteAddress(senderConn);
+            if (!string.IsNullOrWhiteSpace(remoteIp) && IsListedInBanFile(_bannedIpFilePath, remoteIp))
+            {
+                AppendBanValueIfMissing(_bannedUserFilePath, gamerTag);
+                AppendBanValueIfMissing(_bannedUserFilePath, displayName);
+
+                const string denyReason = "BannedIP";
+                connType.GetMethod("Deny", new[] { typeof(string) }).Invoke(senderConn, new object[] { denyReason });
+                _log($"Connection denied: banned IP {remoteIp}");
+                return;
+            }
+
+            if (IsListedInBanFile(_bannedUserFilePath, gamerTag) || IsListedInBanFile(_bannedUserFilePath, displayName))
+            {
+                AppendBanValueIfMissing(_bannedIpFilePath, remoteIp);
+
+                const string denyReason = "BannedUser";
+                connType.GetMethod("Deny", new[] { typeof(string) }).Invoke(senderConn, new object[] { denyReason });
+                _log($"Connection denied: banned user {gamerTag ?? displayName ?? "(unknown)"}");
+                return;
+            }
+
+            if (_whitelistEnabled &&
+                !IsListedInBanFile(_whitelistFilePath, gamerTag) &&
+                !IsListedInBanFile(_whitelistFilePath, displayName))
+            {
+                const string denyReason = "WhitelistOnly";
+                connType.GetMethod("Deny", new[] { typeof(string) }).Invoke(senderConn, new object[] { denyReason });
+                _log($"Connection denied: whitelist required for {gamerTag ?? displayName ?? "(unknown)"}");
+                return;
+            }
+
+            if (gamerTag == "unknow ghost")
             {
                 gamerType.GetProperty("Gamertag")?.SetValue(gamer, "Player");
                 _log("ConnectionApproval: Overwrote 'unknow ghost' with 'Player'");
@@ -799,6 +866,95 @@ namespace CMZServerHost
 
             var peerType = _netPeer.GetType();
             return peerType.GetProperty("Connections")?.GetValue(_netPeer) as System.Collections.IEnumerable;
+        }
+
+        private void EnsureBanFilesExist()
+        {
+            EnsureBanFileExists(_bannedIpFilePath, new[]
+            {
+                "# One IP address per line.",
+                "# Example: 192.168.1.50"
+            });
+
+            EnsureBanFileExists(_bannedUserFilePath, new[]
+            {
+                "# One user name per line.",
+                "# Matches gamertag or display name."
+            });
+        }
+
+        private void EnsureWhitelistFileExists()
+        {
+            if (!_whitelistEnabled)
+                return;
+
+            EnsureBanFileExists(_whitelistFilePath, new[]
+            {
+                "# One user name per line.",
+                "# Only listed usernames may join when whitelist is enabled."
+            });
+        }
+
+        private static void EnsureBanFileExists(string path, IEnumerable<string> headerLines)
+        {
+            if (string.IsNullOrWhiteSpace(path) || File.Exists(path))
+                return;
+
+            string dir = Path.GetDirectoryName(path);
+            if (!string.IsNullOrWhiteSpace(dir))
+                Directory.CreateDirectory(dir);
+
+            File.WriteAllLines(path, headerLines ?? Array.Empty<string>());
+        }
+
+        private static bool IsListedInBanFile(string path, string value)
+        {
+            if (string.IsNullOrWhiteSpace(path) ||
+                string.IsNullOrWhiteSpace(value) ||
+                !File.Exists(path))
+            {
+                return false;
+            }
+
+            foreach (string rawLine in File.ReadLines(path))
+            {
+                string line = (rawLine ?? string.Empty).Trim();
+                if (line.Length == 0 || line.StartsWith("#", StringComparison.Ordinal))
+                    continue;
+
+                if (string.Equals(line, value.Trim(), StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static void AppendBanValueIfMissing(string path, string value)
+        {
+            if (string.IsNullOrWhiteSpace(path) || string.IsNullOrWhiteSpace(value))
+                return;
+
+            string trimmedValue = value.Trim();
+            if (trimmedValue.Length == 0 || IsListedInBanFile(path, trimmedValue))
+                return;
+
+            File.AppendAllLines(path, new[] { trimmedValue });
+        }
+
+        private static string TryGetRemoteAddress(object senderConn)
+        {
+            if (senderConn == null)
+                return null;
+
+            try
+            {
+                var remoteEndPoint = senderConn.GetType().GetProperty("RemoteEndPoint")?.GetValue(senderConn) as IPEndPoint;
+                return remoteEndPoint?.Address?.ToString();
+            }
+            catch
+            {
+                return null;
+            }
         }
         #endregion
 

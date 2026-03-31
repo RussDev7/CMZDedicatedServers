@@ -1,0 +1,11 @@
+C:\Users\Admin\Documents\cmz modded\CMZDedicatedServer\src\CMZServerHost\Build\ServerHost\Libs\0Harmony.dll
+C:\Users\Admin\Documents\cmz modded\CMZDedicatedServer\src\CMZServerHost\Build\ServerHost\server.properties
+C:\Users\Admin\Documents\cmz modded\CMZDedicatedServer\src\CMZServerHost\Build\ServerHost\CMZServerHost.exe
+C:\Users\Admin\Documents\cmz modded\CMZDedicatedServer\src\CMZServerHost\obj\Release\CMZServerHost.csproj.AssemblyReference.cache
+C:\Users\Admin\Documents\cmz modded\CMZDedicatedServer\src\CMZServerHost\obj\Release\CMZServerHost.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\Admin\Documents\cmz modded\CMZDedicatedServer\src\CMZServerHost\obj\Release\CMZServerHost.csproj.CoreCompileInputs.cache
+C:\Users\Admin\Documents\cmz modded\CMZDedicatedServer\src\CMZServerHost\obj\Release\CMZServerHost.exe
+C:\Users\Admin\Documents\cmz modded\CMZDedicatedServer\src\CMZServerHost\Build\ServerHost\banned-ip.txt
+C:\Users\Admin\Documents\cmz modded\CMZDedicatedServer\src\CMZServerHost\Build\ServerHost\banned-user.txt
+C:\Users\Admin\Documents\cmz modded\CMZDedicatedServer\src\CMZServerHost\Build\ServerHost\whitelist.txt
+C:\Users\Admin\Documents\cmz modded\CMZDedicatedServer\src\CMZServerHost\Build\ServerHost\plugins\README.txt

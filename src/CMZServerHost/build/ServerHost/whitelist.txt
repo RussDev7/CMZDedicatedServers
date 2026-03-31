@@ -1,0 +1,2 @@
+# One user name per line.
+# Only names listed here may join when whitelist=true.
