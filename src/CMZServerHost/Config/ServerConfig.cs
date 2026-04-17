@@ -154,6 +154,14 @@ namespace CMZServerHost
         /// </summary>
         public bool WhitelistEnabled { get; private set; } = false;
 
+<<<<<<< Updated upstream
+=======
+        /// <summary>
+        /// When enabled, verbose packet / host debug logs are written to the console.
+        /// </summary>
+        public bool ShowDebugNetworkLogs { get; private set; } = false;
+
+>>>>>>> Stashed changes
         #endregion
 
         #region Load
@@ -298,6 +306,12 @@ namespace CMZServerHost
             if (map.TryGetValue("whitelist", out var whitelistEnabled) && bool.TryParse(whitelistEnabled, out var whitelistEnabledValue))
                 cfg.WhitelistEnabled = whitelistEnabledValue;
 
+<<<<<<< Updated upstream
+=======
+            if (map.TryGetValue("show-debug-network-logs", out var showDebugNetworkLogs) && bool.TryParse(showDebugNetworkLogs, out var showDebugNetworkLogsValue))
+                cfg.ShowDebugNetworkLogs = showDebugNetworkLogsValue;
+
+>>>>>>> Stashed changes
             #endregion
 
             #region Derived Paths

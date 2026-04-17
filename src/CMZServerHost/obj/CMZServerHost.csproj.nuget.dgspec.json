@@ -31,6 +31,10 @@
         },
         "frameworks": {
           "net481": {
+<<<<<<< Updated upstream
+=======
+            "framework": "net481",
+>>>>>>> Stashed changes
             "targetAlias": "net481",
             "projectReferences": {}
           }
@@ -49,6 +53,7 @@
       },
       "frameworks": {
         "net481": {
+<<<<<<< Updated upstream
           "targetAlias": "net481",
           "dependencies": {
             "Microsoft.NETFramework.ReferenceAssemblies": {
@@ -59,6 +64,11 @@
             }
           },
           "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\10.0.201\\RuntimeIdentifierGraph.json"
+=======
+          "framework": "net481",
+          "targetAlias": "net481",
+          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\10.0.202\\RuntimeIdentifierGraph.json"
+>>>>>>> Stashed changes
         }
       },
       "runtimes": {

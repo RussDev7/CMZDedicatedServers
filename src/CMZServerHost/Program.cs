@@ -221,6 +221,37 @@ namespace CMZServerHost
 
                 #endregion
 
+                #region Console Log Filtering
+
+                bool showDebugNetworkLogs = config.ShowDebugNetworkLogs;
+
+                bool ShouldSuppressConsoleLog(string message)
+                {
+                    if (showDebugNetworkLogs || string.IsNullOrWhiteSpace(message))
+                        return false;
+
+                    return message.StartsWith("CH0 recv:", StringComparison.Ordinal) ||
+                           message.StartsWith("CH1 OP4 recv:", StringComparison.Ordinal) ||
+                           message.StartsWith("[HostMsg]", StringComparison.Ordinal) ||
+                           message.StartsWith("[Server] Incoming MessageType =", StringComparison.Ordinal) ||
+                           message.StartsWith("ServerWorld: FAILED to load world.info via SaveDevice.", StringComparison.Ordinal) ||
+                           message.StartsWith("ServerWorld: FAILED to load world.info directly from disk.", StringComparison.Ordinal) ||
+                           message.StartsWith("ServerWorld: Created default world.info.", StringComparison.Ordinal) ||
+                           message.StartsWith("ServerWorld TryLoadWorldInfoDirectFromDisk:", StringComparison.Ordinal) ||
+                           message.StartsWith("ServerWorld InvokeSaveDeviceSave:", StringComparison.Ordinal) ||
+                           message.StartsWith("ServerWorld TryCreateDefaultWorldInfo:", StringComparison.Ordinal);
+                }
+
+                void WriteServerLog(string message)
+                {
+                    if (ShouldSuppressConsoleLog(message))
+                        return;
+
+                    Console.WriteLine(message);
+                }
+
+                #endregion
+
                 #region Create Server Instance
 
                 /// <summary>
@@ -235,7 +266,11 @@ namespace CMZServerHost
                     gamePath: gamePath,
                     port: config.Port,
                     maxPlayers: config.MaxPlayers,
+<<<<<<< Updated upstream
                     log: _ => { },
+=======
+                    log: WriteServerLog,
+>>>>>>> Stashed changes
                     gameAsm: gameAsm,
                     worldFolder: string.IsNullOrWhiteSpace(config.WorldFolder) ? null : config.WorldFolder,
                     saveRoot: baseDir,

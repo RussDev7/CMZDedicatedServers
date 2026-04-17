@@ -319,8 +319,7 @@ namespace CMZServerHost
 
             if (_gameAsm != null &&
                 !string.IsNullOrWhiteSpace(_worldFolder) &&
-                !string.IsNullOrWhiteSpace(_saveRoot) &&
-                _saveOwnerSteamId != 0UL)
+                !string.IsNullOrWhiteSpace(_saveRoot))
             {
                 _worldHandler = new ServerWorldHandler(
                     _gamePath,
@@ -434,11 +433,8 @@ namespace CMZServerHost
 
             CreateHostGamer(xnaAsm);
 
-            if (_worldHandler != null && _gameAsm != null)
+            if (_gameAsm != null)
             {
-                if (_gameAsm == null)
-                    throw new InvalidOperationException("_gameAsm is null.");
-
                 if (_commonAsm == null)
                     throw new InvalidOperationException("_commonAsm is null.");
 
@@ -755,6 +751,18 @@ namespace CMZServerHost
                 return;
             }
 
+            var connType = _commonAsm.GetType("DNA.Net.Lidgren.NetConnection");
+            Action<string> deny = reason =>
+            {
+                try
+                {
+                    connType?.GetMethod("Deny", new[] { typeof(string) })?.Invoke(senderConn, new object[] { reason });
+                }
+                catch
+                {
+                }
+            };
+
             var lidgrenExt = _commonAsm.GetType("DNA.Net.GamerServices.LidgrenExtensions");
             var netBufferType = _commonAsm.GetType("DNA.Net.Lidgren.NetBuffer");
             var readMethod = lidgrenExt?.GetMethod(
@@ -765,23 +773,49 @@ namespace CMZServerHost
                 null);
 
             if (readMethod == null)
+            {
+                deny("ConnectReadMethodMissing");
+                _log("Connection denied: ReadRequestConnectToHostMessage method not found.");
                 return;
+            }
 
-            var crm = readMethod.Invoke(null, new object[] { msg, _gameName, _networkVersion });
+            object crm = null;
+            string[] gameNameCandidates = new[]
+            {
+                _gameName,
+                "CastleMinerZSteam",
+                "CastleMiner Z",
+                "CastleMinerZ"
+            };
+
+            foreach (var candidate in gameNameCandidates)
+            {
+                if (string.IsNullOrWhiteSpace(candidate))
+                    continue;
+
+                crm = readMethod.Invoke(null, new object[] { msg, candidate, _networkVersion });
+                if (crm != null)
+                    break;
+            }
+
             if (crm == null)
+            {
+                deny("GameNameOrVersionMismatch");
+                _log("Connection denied: could not parse connect request (game-name/network-version mismatch).");
                 return;
+            }
 
             var readResultField = crm.GetType().GetField("ReadResult", BindingFlags.Public | BindingFlags.Instance | BindingFlags.FlattenHierarchy);
             var readResult = readResultField?.GetValue(crm);
             if (readResult == null)
             {
+                deny("ReadResultMissing");
                 _log("ConnectionApproval: ReadResult is null");
                 return;
             }
 
             var successVal = Enum.Parse(readResult.GetType(), "Success");
 
-            var connType = _commonAsm.GetType("DNA.Net.Lidgren.NetConnection");
             if (connType == null)
             {
                 _log("NetConnection type not found");
@@ -799,6 +833,7 @@ namespace CMZServerHost
             var gamer = crm.GetType().GetField("Gamer")?.GetValue(crm);
             if (gamer == null)
             {
+                deny("GamerMissing");
                 _log("ConnectionApproval: Gamer is null");
                 return;
             }
@@ -810,6 +845,7 @@ namespace CMZServerHost
 
             string remoteIp = TryGetRemoteAddress(senderConn);
             if (!string.IsNullOrWhiteSpace(remoteIp) && IsListedInBanFile(_bannedIpFilePath, remoteIp))
+<<<<<<< Updated upstream
             {
                 AppendBanValueIfMissing(_bannedUserFilePath, gamerTag);
                 AppendBanValueIfMissing(_bannedUserFilePath, displayName);
@@ -841,14 +877,42 @@ namespace CMZServerHost
             }
 
             if (gamerTag == "unknow ghost")
+=======
+>>>>>>> Stashed changes
             {
-                gamerType.GetProperty("Gamertag")?.SetValue(gamer, "Player");
-                _log("ConnectionApproval: Overwrote 'unknow ghost' with 'Player'");
+                AppendBanValueIfMissing(_bannedUserFilePath, gamerTag);
+                AppendBanValueIfMissing(_bannedUserFilePath, displayName);
+
+                const string denyReason = "BannedIP";
+                connType.GetMethod("Deny", new[] { typeof(string) }).Invoke(senderConn, new object[] { denyReason });
+                _log($"Connection denied: banned IP {remoteIp}");
+                return;
+            }
+
+            if (IsListedInBanFile(_bannedUserFilePath, gamerTag) || IsListedInBanFile(_bannedUserFilePath, displayName))
+            {
+                AppendBanValueIfMissing(_bannedIpFilePath, remoteIp);
+
+                const string denyReason = "BannedUser";
+                connType.GetMethod("Deny", new[] { typeof(string) }).Invoke(senderConn, new object[] { denyReason });
+                _log($"Connection denied: banned user {gamerTag ?? displayName ?? "(unknown)"}");
+                return;
+            }
+
+            if (_whitelistEnabled &&
+                !IsListedInBanFile(_whitelistFilePath, gamerTag) &&
+                !IsListedInBanFile(_whitelistFilePath, displayName))
+            {
+                const string denyReason = "WhitelistOnly";
+                connType.GetMethod("Deny", new[] { typeof(string) }).Invoke(senderConn, new object[] { denyReason });
+                _log($"Connection denied: whitelist required for {gamerTag ?? displayName ?? "(unknown)"}");
+                return;
             }
 
             var tagProp = connType.GetProperty("Tag", BindingFlags.Public | BindingFlags.Instance);
             if (tagProp == null)
             {
+                deny("ConnectionTagMissing");
                 _log("ConnectionApproval: Tag property not found");
                 return;
             }

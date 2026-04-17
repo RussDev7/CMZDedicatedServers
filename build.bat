@@ -46,7 +46,9 @@ if exist ".\release\*.config" del /f /q /s ".\release\*.config"
 
 Rem | Delete & Create ZIP Release
 if exist ".\%filename%.zip" (del /f ".\%filename%.zip")
-powershell.exe -nologo -noprofile -command "Compress-Archive -Path ".\release\*" -DestinationPath ".\%filename%.zip""
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command ^
+  "Add-Type -AssemblyName 'System.IO.Compression.FileSystem';" ^
+  "[System.IO.Compression.ZipFile]::CreateFromDirectory((Resolve-Path '.\release').Path, (Join-Path (Get-Location) '%filename%.zip'))"
 
 Rem | Operation Complete
 echo(

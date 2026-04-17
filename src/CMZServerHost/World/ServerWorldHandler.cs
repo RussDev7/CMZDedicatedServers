@@ -295,7 +295,16 @@ namespace CMZServerHost
                 if (!ok || worldInfo == null)
                 {
                     _log("ServerWorld: FAILED to load world.info via SaveDevice.");
-                    return;
+                    if (!TryLoadWorldInfoDirectFromDisk(worldInfoType, relativePath, out worldInfo))
+                    {
+                        _log("ServerWorld: FAILED to load world.info directly from disk.");
+                    }
+
+                    if (worldInfo == null && !TryCreateDefaultWorldInfo(worldInfoType, relativePath, out worldInfo))
+                    {
+                        _log("ServerWorld: FAILED to create default world.info.");
+                        return;
+                    }
                 }
 
                 _worldInfo = worldInfo;
@@ -336,6 +345,339 @@ namespace CMZServerHost
             {
                 _log("ServerWorld LoadWorldInfo: " + ex.GetType().FullName + ": " + ex.Message);
                 _log(ex.StackTrace ?? "(no stack trace)");
+            }
+        }
+
+        /// <summary>
+        /// Attempts to load world.info directly from disk, bypassing SaveDevice encryption/key handling.
+        /// </summary>
+        private bool TryLoadWorldInfoDirectFromDisk(Type worldInfoType, string relativePath, out object worldInfo)
+        {
+            worldInfo = null;
+
+            try
+            {
+                string absolutePath = Path.Combine(_saveRoot, relativePath);
+                if (!File.Exists(absolutePath))
+                    return false;
+
+                using (var stream = File.OpenRead(absolutePath))
+                using (var reader = new BinaryReader(stream))
+                {
+                    var ctor = worldInfoType.GetConstructor(
+                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                        null,
+                        new[] { typeof(BinaryReader) },
+                        null);
+
+                    if (ctor != null)
+                    {
+                        worldInfo = ctor.Invoke(new object[] { reader });
+                    }
+                    else
+                    {
+                        var defaultCtor = worldInfoType.GetConstructor(
+                            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                            null,
+                            Type.EmptyTypes,
+                            null);
+
+                        if (defaultCtor == null)
+                            return false;
+
+                        worldInfo = defaultCtor.Invoke(null);
+
+                        var loadMethod = worldInfoType.GetMethod(
+                            "Load",
+                            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                            null,
+                            new[] { typeof(BinaryReader) },
+                            null);
+
+                        if (loadMethod == null)
+                            return false;
+
+                        loadMethod.Invoke(worldInfo, new object[] { reader });
+                    }
+                }
+
+                _log("ServerWorld: Loaded world.info directly from disk.");
+                return worldInfo != null;
+            }
+            catch (TargetInvocationException tie)
+            {
+                Exception inner = tie.InnerException ?? tie;
+                _log("ServerWorld TryLoadWorldInfoDirectFromDisk: " + inner.GetType().FullName + ": " + inner.Message);
+                _log(inner.StackTrace ?? "(no stack trace)");
+                return false;
+            }
+            catch (Exception ex)
+            {
+                _log("ServerWorld TryLoadWorldInfoDirectFromDisk: " + ex.GetType().FullName + ": " + ex.Message);
+                _log(ex.StackTrace ?? "(no stack trace)");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Creates a new default WorldInfo and writes it through SaveDevice when loading world.info fails.
+        /// </summary>
+        private bool TryCreateDefaultWorldInfo(Type worldInfoType, string relativePath, out object worldInfo)
+        {
+            worldInfo = null;
+
+            try
+            {
+                var defaultCtor = worldInfoType.GetConstructor(
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                    null,
+                    Type.EmptyTypes,
+                    null);
+
+                if (defaultCtor == null)
+                    return false;
+
+                object createdWorldInfo = defaultCtor.Invoke(null);
+                PrepareDefaultWorldInfo(createdWorldInfo, worldInfoType);
+
+                string worldDir = Path.GetDirectoryName(relativePath);
+                if (!string.IsNullOrWhiteSpace(worldDir) && !_saveDeviceDirectoryExists(worldDir))
+                {
+                    _saveDeviceCreateDirectory(worldDir);
+                }
+
+                bool saved = InvokeSaveDeviceSave(relativePath, stream =>
+                {
+                    using (var writer = new BinaryWriter(stream))
+                    {
+                        var saveMethod = worldInfoType.GetMethod(
+                            "Save",
+                            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                            null,
+                            new[] { typeof(BinaryWriter) },
+                            null);
+
+                        if (saveMethod != null)
+                        {
+                            try
+                            {
+                                saveMethod.Invoke(createdWorldInfo, new object[] { writer });
+                            }
+                            catch (TargetInvocationException tie)
+                            {
+                                Exception inner = tie.InnerException ?? tie;
+                                throw new InvalidOperationException(
+                                    "WorldInfo.Save(BinaryWriter) failed: " + inner.GetType().FullName + ": " + inner.Message,
+                                    inner);
+                            }
+                        }
+                        else
+                        {
+                            var writeMethod = worldInfoType.GetMethod(
+                                "Write",
+                                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                                null,
+                                new[] { typeof(BinaryWriter) },
+                                null);
+
+                            if (writeMethod == null)
+                                throw new InvalidOperationException("WorldInfo.Save/Write(BinaryWriter) not found.");
+
+                            try
+                            {
+                                writeMethod.Invoke(createdWorldInfo, new object[] { writer });
+                            }
+                            catch (TargetInvocationException tie)
+                            {
+                                Exception inner = tie.InnerException ?? tie;
+                                throw new InvalidOperationException(
+                                    "WorldInfo.Write(BinaryWriter) failed: " + inner.GetType().FullName + ": " + inner.Message,
+                                    inner);
+                            }
+                        }
+
+                        writer.Flush();
+                    }
+                });
+
+                if (!saved)
+                    return false;
+
+                worldInfo = createdWorldInfo;
+                _log("ServerWorld: Created default world.info.");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Exception inner = ex is TargetInvocationException tie && tie.InnerException != null
+                    ? tie.InnerException
+                    : ex;
+
+                _log("ServerWorld TryCreateDefaultWorldInfo: " + inner.GetType().FullName + ": " + inner.Message);
+                _log(inner.StackTrace ?? "(no stack trace)");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Populates reflected WorldInfo defaults so the game's Save(BinaryWriter) path has the minimum required data.
+        /// </summary>
+        private void PrepareDefaultWorldInfo(object worldInfo, Type worldInfoType)
+        {
+            if (worldInfo == null || worldInfoType == null)
+                return;
+
+            try
+            {
+                string worldName = "CMZ Dedicated World";
+                string worldDescription = "Generated by CMZ Dedicated Server";
+
+                foreach (FieldInfo field in worldInfoType.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+                {
+                    object currentValue = null;
+                    try { currentValue = field.GetValue(worldInfo); } catch { }
+
+                    if (field.FieldType == typeof(string) && currentValue == null)
+                    {
+                        string value = GetDefaultStringValueForMember(field.Name, worldName, worldDescription);
+                        try { field.SetValue(worldInfo, value); } catch { }
+                        continue;
+                    }
+
+                    if (currentValue == null)
+                    {
+                        object defaultValue = CreateDefaultReferenceValue(field.FieldType);
+                        if (defaultValue != null)
+                        {
+                            try { field.SetValue(worldInfo, defaultValue); } catch { }
+                        }
+                    }
+                }
+
+                foreach (PropertyInfo prop in worldInfoType.GetProperties(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+                {
+                    if (!prop.CanRead || !prop.CanWrite || prop.GetIndexParameters().Length != 0)
+                        continue;
+
+                    object currentValue = null;
+                    try { currentValue = prop.GetValue(worldInfo, null); } catch { }
+
+                    if (prop.PropertyType == typeof(string) && currentValue == null)
+                    {
+                        string value = GetDefaultStringValueForMember(prop.Name, worldName, worldDescription);
+                        try { prop.SetValue(worldInfo, value, null); } catch { }
+                        continue;
+                    }
+
+                    if (currentValue == null)
+                    {
+                        object defaultValue = CreateDefaultReferenceValue(prop.PropertyType);
+                        if (defaultValue != null)
+                        {
+                            try { prop.SetValue(worldInfo, defaultValue, null); } catch { }
+                        }
+                    }
+                }
+
+                TrySetMemberValue(worldInfo, "SavePath", _worldFolder);
+                TrySetMemberValue(worldInfo, "_savePath", _worldFolder);
+                TrySetMemberValue(worldInfo, "Name", worldName);
+                TrySetMemberValue(worldInfo, "_name", worldName);
+                TrySetMemberValue(worldInfo, "Description", worldDescription);
+                TrySetMemberValue(worldInfo, "_description", worldDescription);
+
+                if (TryCreateVector3(8f, 128f, -8f, out object position))
+                {
+                    TrySetMemberValue(worldInfo, "LastPosition", position);
+                    TrySetMemberValue(worldInfo, "_lastPosition", position);
+                }
+
+                if (Guid.TryParse(Path.GetFileName(_worldFolder), out Guid parsedGuid))
+                {
+                    TrySetMemberValue(worldInfo, "WorldID", parsedGuid);
+                    TrySetMemberValue(worldInfo, "_worldID", parsedGuid);
+                    TrySetMemberValue(worldInfo, "Guid", parsedGuid);
+                    TrySetMemberValue(worldInfo, "_guid", parsedGuid);
+                }
+            }
+            catch (Exception ex)
+            {
+                _log("ServerWorld PrepareDefaultWorldInfo: " + ex.GetType().FullName + ": " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// Returns a best-effort default string value for known WorldInfo member names.
+        /// </summary>
+        private static string GetDefaultStringValueForMember(string memberName, string worldName, string worldDescription)
+        {
+            if (string.IsNullOrWhiteSpace(memberName))
+                return string.Empty;
+
+            string name = memberName.Trim().TrimStart('_');
+            if (name.IndexOf("name", StringComparison.OrdinalIgnoreCase) >= 0)
+                return worldName;
+            if (name.IndexOf("description", StringComparison.OrdinalIgnoreCase) >= 0)
+                return worldDescription;
+            if (name.IndexOf("creator", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "DedicatedServer";
+            if (name.IndexOf("host", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "DedicatedServer";
+            return string.Empty;
+        }
+
+        /// <summary>
+        /// Creates a default reference-type value for common collection/object members.
+        /// </summary>
+        private static object CreateDefaultReferenceValue(Type memberType)
+        {
+            if (memberType == null)
+                return null;
+
+            if (memberType == typeof(string))
+                return string.Empty;
+
+            if (memberType.IsValueType)
+                return null;
+
+            if (memberType.IsAbstract || memberType.IsInterface)
+                return null;
+
+            try
+            {
+                return Activator.CreateInstance(memberType);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        /// Attempts to create a reflected Microsoft.Xna.Framework.Vector3 instance.
+        /// </summary>
+        private bool TryCreateVector3(float x, float y, float z, out object vector)
+        {
+            vector = null;
+
+            try
+            {
+                Type vectorType =
+                    ResolveType("Microsoft.Xna.Framework.Vector3") ??
+                    Type.GetType("Microsoft.Xna.Framework.Vector3, Microsoft.Xna.Framework", false);
+
+                if (vectorType == null)
+                    return false;
+
+                var ctor = vectorType.GetConstructor(new[] { typeof(float), typeof(float), typeof(float) });
+                if (ctor == null)
+                    return false;
+
+                vector = ctor.Invoke(new object[] { x, y, z });
+                return true;
+            }
+            catch
+            {
+                return false;
             }
         }
 
@@ -1005,7 +1347,12 @@ namespace CMZServerHost
             }
             catch (Exception ex)
             {
-                _log("ServerWorld InvokeSaveDeviceSave: " + ex.Message);
+                Exception inner = ex is TargetInvocationException tie && tie.InnerException != null
+                    ? tie.InnerException
+                    : ex;
+
+                _log("ServerWorld InvokeSaveDeviceSave: " + inner.GetType().FullName + ": " + inner.Message);
+                _log(inner.StackTrace ?? "(no stack trace)");
                 return false;
             }
         }
@@ -2300,11 +2647,9 @@ namespace CMZServerHost
         {
             try
             {
-                if (_saveOwnerSteamId == 0UL)
-                {
-                    _log("ServerWorld: save-owner-steam-id is required.");
-                    return;
-                }
+                ulong effectiveSaveOwnerSteamId = _saveOwnerSteamId != 0UL
+                    ? _saveOwnerSteamId
+                    : DeriveFallbackSaveOwnerSteamId();
 
                 Type md5Type = ResolveType("DNA.Security.Cryptography.MD5HashProvider");
                 Type fsSaveType = ResolveType("DNA.IO.Storage.FileSystemSaveDevice");
@@ -2322,7 +2667,7 @@ namespace CMZServerHost
                 }
 
                 object md5 = Activator.CreateInstance(md5Type);
-                byte[] sourceBytes = Encoding.UTF8.GetBytes(_saveOwnerSteamId.ToString() + "CMZ778");
+                byte[] sourceBytes = Encoding.UTF8.GetBytes(effectiveSaveOwnerSteamId.ToString() + "CMZ778");
 
                 MethodInfo computeMethod = md5Type.GetMethod("Compute", new[] { typeof(byte[]) });
                 if (computeMethod == null)
@@ -2405,6 +2750,36 @@ namespace CMZServerHost
             {
                 return false;
             }
+        }
+
+        /// <summary>
+        /// Builds a stable non-zero fallback save-owner id when save-owner-steam-id is omitted.
+        ///
+        /// Notes:
+        /// - Uses FNV-1a 64-bit over world/save identity text so the value is deterministic.
+        /// - This avoids requiring users to supply a fake Steam ID just to host a world.
+        /// </summary>
+        private ulong DeriveFallbackSaveOwnerSteamId()
+        {
+            const ulong fnvOffset = 14695981039346656037UL;
+            const ulong fnvPrime = 1099511628211UL;
+
+            string seed = (_worldFolder ?? string.Empty) + "|" + (_saveRoot ?? string.Empty) + "|" + (_gamePath ?? string.Empty);
+            ulong hash = fnvOffset;
+
+            foreach (char c in seed)
+            {
+                hash ^= (byte)(c & 0xFF);
+                hash *= fnvPrime;
+                hash ^= (byte)((c >> 8) & 0xFF);
+                hash *= fnvPrime;
+            }
+
+            if (hash == 0UL)
+                hash = 1UL;
+
+            _log("ServerWorld: save-owner-steam-id not set, using deterministic local fallback id.");
+            return hash;
         }
         #endregion
 
