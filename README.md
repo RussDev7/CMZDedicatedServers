@@ -1,4 +1,4 @@
-# CMZDedicatedServer
+# CMZDedicatedServers
 
 A dedicated server host for **CastleMiner Z** built in **C# / .NET Framework 4.8.1**.
 
@@ -25,7 +25,7 @@ Both hosts load the original game/runtime assemblies through reflection, start a
 ## Project layout
 
 ```text
-CMZDedicatedServer/
+CMZDedicatedServers/
 ├─ LICENSE
 ├─ README.md
 ├─ build.bat
@@ -34,63 +34,62 @@ CMZDedicatedServer/
 ├─ Build/
 │  ├─ CMZDedicatedSteamServer/
 │  └─ CMZDedicatedLidgrenServer/
-└─ src/
-   ├─ CMZDedicatedServers.sln
-   ├─ CMZDedicatedLidgrenServer/
-   │  ├─ CMZDedicatedLidgrenServer.csproj
-   │  ├─ Program.cs
-   │  ├─ Config/
-   │  │  └─ ServerConfig.cs
-   │  ├─ Hosting/
-   │  │  ├─ LidgrenServer.cs
-   │  │  ├─ ServerAssemblyLoader.cs
-   │  │  └─ ServerRuntime.cs
-   │  ├─ Networking/
-   │  │  └─ CmzMessageCodec.cs
-   │  ├─ Patching/
-   │  │  └─ ServerPatches.cs
-   │  ├─ Templates/
-   │  │  └─ server.properties
-   │  ├─ World/
-   │  │  └─ ServerWorldHandler.cs
-   │  ├─ Libs/
-   │  │  └─ 0Harmony.dll
-   │  └─ ServerHost/
-   │     ├─ RunServer.bat
-   │     ├─ Game/
-   │     ├─ Inventory/
-   │     ├─ Libs/
-   │     └─ Worlds/
-   └─ CMZDedicatedSteamServer/
-      ├─ CMZDedicatedSteamServer.csproj
-      ├─ Program.cs
-      ├─ Common/
-      │  └─ ReflectEx.cs
-      ├─ Config/
-      │  └─ SteamServerConfig.cs
-      ├─ Hosting/
-      │  ├─ ServerAssemblyLoader.cs
-      │  ├─ SteamConnectionApproval.cs
-      │  ├─ SteamDedicatedServer.cs
-      │  ├─ SteamLobbyHost.cs
-      │  └─ SteamPeerRegistry.cs
-      ├─ Networking/
-      │  └─ CmzMessageCodec.cs
-      ├─ Steam/
-      │  └─ SteamServerBootstrap.cs
-      ├─ Templates/
-      │  ├─ server.properties
-      │  └─ steam_appid.txt
-      ├─ World/
-      │  └─ ServerWorldHandler.cs
+├─ CMZDedicatedServers.sln
+├─ CMZDedicatedLidgrenServer/
+│  ├─ CMZDedicatedLidgrenServer.csproj
+│  ├─ Program.cs
+│  ├─ Config/
+│  │  └─ ServerConfig.cs
+│  ├─ Hosting/
+│  │  ├─ LidgrenServer.cs
+│  │  ├─ ServerAssemblyLoader.cs
+│  │  └─ ServerRuntime.cs
+│  ├─ Networking/
+│  │  └─ CmzMessageCodec.cs
+│  ├─ Patching/
+│  │  └─ ServerPatches.cs
+│  ├─ Templates/
+│  │  └─ server.properties
+│  ├─ World/
+│  │  └─ ServerWorldHandler.cs
+│  ├─ Libs/
+│  │  └─ 0Harmony.dll
+│  └─ ServerHost/
+│     ├─ RunServer.bat
+│     ├─ Game/
+│     ├─ Inventory/
+│     ├─ Libs/
+│     └─ Worlds/
+└─ CMZDedicatedSteamServer/
+   ├─ CMZDedicatedSteamServer.csproj
+   ├─ Program.cs
+   ├─ Common/
+   │  └─ ReflectEx.cs
+   ├─ Config/
+   │  └─ SteamServerConfig.cs
+   ├─ Hosting/
+   │  ├─ ServerAssemblyLoader.cs
+   │  ├─ SteamConnectionApproval.cs
+   │  ├─ SteamDedicatedServer.cs
+   │  ├─ SteamLobbyHost.cs
+   │  └─ SteamPeerRegistry.cs
+   ├─ Networking/
+   │  └─ CmzMessageCodec.cs
+   ├─ Steam/
+   │  └─ SteamServerBootstrap.cs
+   ├─ Templates/
+   │  ├─ server.properties
+   │  └─ steam_appid.txt
+   ├─ World/
+   │  └─ ServerWorldHandler.cs
+   ├─ Libs/
+   │  └─ 0Harmony.dll
+   └─ ServerHost/
+      ├─ RunServer.bat
+      ├─ Game/
+      ├─ Inventory/
       ├─ Libs/
-      │  └─ 0Harmony.dll
-      └─ ServerHost/
-         ├─ RunServer.bat
-         ├─ Game/
-         ├─ Inventory/
-         ├─ Libs/
-         └─ Worlds/
+      └─ Worlds/
 ```
 
 ## Main components
