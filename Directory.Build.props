@@ -1,0 +1,6 @@
+<Project>
+  <PropertyGroup>
+    <!-- Repo root because this file sits in CMZDedicatedServer\ -->
+    <BuildOutputRoot>$(MSBuildThisFileDirectory)Build\</BuildOutputRoot>
+  </PropertyGroup>
+</Project>

@@ -1,0 +1,28 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 18
+VisualStudioVersion = 18.5.11709.299
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CMZDedicatedLidgrenServer", "CMZDedicatedLidgrenServer\CMZDedicatedLidgrenServer.csproj", "{45F2E5AA-2698-6F98-6E31-79A6AFB5B126}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CMZDedicatedSteamServer", "CMZDedicatedSteamServer\CMZDedicatedSteamServer.csproj", "{AF549B52-0F00-D4BA-E890-001E3B26958B}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x86 = Debug|x86
+		Release|x86 = Release|x86
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{45F2E5AA-2698-6F98-6E31-79A6AFB5B126}.Debug|x86.ActiveCfg = Debug|x86
+		{45F2E5AA-2698-6F98-6E31-79A6AFB5B126}.Debug|x86.Build.0 = Debug|x86
+		{45F2E5AA-2698-6F98-6E31-79A6AFB5B126}.Release|x86.ActiveCfg = Release|x86
+		{45F2E5AA-2698-6F98-6E31-79A6AFB5B126}.Release|x86.Build.0 = Release|x86
+		{AF549B52-0F00-D4BA-E890-001E3B26958B}.Debug|x86.ActiveCfg = Debug|x86
+		{AF549B52-0F00-D4BA-E890-001E3B26958B}.Debug|x86.Build.0 = Debug|x86
+		{AF549B52-0F00-D4BA-E890-001E3B26958B}.Release|x86.ActiveCfg = Release|x86
+		{AF549B52-0F00-D4BA-E890-001E3B26958B}.Release|x86.Build.0 = Release|x86
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal

@@ -2,104 +2,158 @@
 
 A dedicated server host for **CastleMiner Z** built in **C# / .NET Framework 4.8.1**.
 
-This project loads the original game/runtime assemblies through reflection, starts a Lidgren-backed compatible server, and hosts persistent world state outside the normal game client.
+This project now uses a **split host layout** with two dedicated server implementations:
+- **CMZDedicatedSteamServer** for Steam-based dedicated hosting
+- **CMZDedicatedLidgrenServer** for direct-IP / Lidgren-based dedicated hosting
+
+Both hosts load the original game/runtime assemblies through reflection, start a compatible dedicated server runtime, and host persistent world state outside the normal game client.
 
 ## What it does
 
 - Starts a dedicated CastleMiner Z compatible server by IP and port
 - Loads the original game assemblies at runtime via reflection
 - Supports a configurable `game-path` instead of requiring the game under a hardcoded local `Game` folder
-- Loads Harmony from a local `libs` folder instead of next to the executable
+- Loads Harmony from a local `Libs` folder instead of next to the executable
 - Handles connection approval, discovery/session metadata, and gameplay packet relay
 - Hosts world state server-side through `ServerWorldHandler`
 - Loads `world.info`, chunk delta data, and player inventories from disk
 - Relays player visibility, movement, text, block edits, chunk requests, pickups, and inventory flow
 - Keeps authoritative day/time progression server-side and periodically broadcasts it to clients
 - Supports a configurable bind IP, port, player count, world GUID, view distance, and tick rate
+- Separates the dedicated server implementations into **Steam** and **Lidgren** projects while keeping the shared project flow familiar
 
 ## Project layout
 
 ```text
-CMZDedicatedServer-main/
+CMZDedicatedServer/
 ├─ LICENSE
 ├─ README.md
 ├─ build.bat
 ├─ clean.bat
+├─ Directory.Build.props
+├─ Build/
+│  ├─ CMZDedicatedSteamServer/
+│  └─ CMZDedicatedLidgrenServer/
 └─ src/
-   ├─ CMZServerHost.sln
-   └─ CMZServerHost/
-      ├─ App.config
-      ├─ CMZServerHost.csproj
-      ├─ CmzMessageCodec.cs
-      ├─ LidgrenServer.cs
+   ├─ CMZDedicatedServers.sln
+   ├─ CMZDedicatedLidgrenServer/
+   │  ├─ CMZDedicatedLidgrenServer.csproj
+   │  ├─ Program.cs
+   │  ├─ Config/
+   │  │  └─ ServerConfig.cs
+   │  ├─ Hosting/
+   │  │  ├─ LidgrenServer.cs
+   │  │  ├─ ServerAssemblyLoader.cs
+   │  │  └─ ServerRuntime.cs
+   │  ├─ Networking/
+   │  │  └─ CmzMessageCodec.cs
+   │  ├─ Patching/
+   │  │  └─ ServerPatches.cs
+   │  ├─ Templates/
+   │  │  └─ server.properties
+   │  ├─ World/
+   │  │  └─ ServerWorldHandler.cs
+   │  ├─ Libs/
+   │  │  └─ 0Harmony.dll
+   │  └─ ServerHost/
+   │     ├─ RunServer.bat
+   │     ├─ Game/
+   │     ├─ Inventory/
+   │     ├─ Libs/
+   │     └─ Worlds/
+   └─ CMZDedicatedSteamServer/
+      ├─ CMZDedicatedSteamServer.csproj
       ├─ Program.cs
-      ├─ ServerAssemblyLoader.cs
-      ├─ ServerConfig.cs
-      ├─ ServerPatches.cs
-      ├─ ServerRuntime.cs
-      ├─ ServerWorldHandler.cs
-      ├─ lib/
+      ├─ Common/
+      │  └─ ReflectEx.cs
+      ├─ Config/
+      │  └─ SteamServerConfig.cs
+      ├─ Hosting/
+      │  ├─ ServerAssemblyLoader.cs
+      │  ├─ SteamConnectionApproval.cs
+      │  ├─ SteamDedicatedServer.cs
+      │  ├─ SteamLobbyHost.cs
+      │  └─ SteamPeerRegistry.cs
+      ├─ Networking/
+      │  └─ CmzMessageCodec.cs
+      ├─ Steam/
+      │  └─ SteamServerBootstrap.cs
+      ├─ Templates/
+      │  ├─ server.properties
+      │  └─ steam_appid.txt
+      ├─ World/
+      │  └─ ServerWorldHandler.cs
+      ├─ Libs/
       │  └─ 0Harmony.dll
-      └─ build/
-         └─ ServerHost/
-            ├─ CMZServerHost.exe
-            ├─ server.properties
-            ├─ Libs/
-            │  └─ 0Harmony.dll
-            └─ Game/
-               ├─ CastleMinerZ.exe
-               ├─ DNA.Common.dll
-               └─ game content files...
+      └─ ServerHost/
+         ├─ RunServer.bat
+         ├─ Game/
+         ├─ Inventory/
+         ├─ Libs/
+         └─ Worlds/
 ```
 
 ## Main components
 
 ### `Program.cs`
-Entry point for the dedicated host.
+Entry point for each dedicated host.
 
 It:
 - loads `server.properties`
-- resolves the game binaries folder from `game-path` or falls back to `./game`
-- resolves support libraries from `./libs`
+- resolves the game binaries folder from `game-path` or falls back to the local server layout
+- resolves support libraries from the local `Libs` folder
 - loads `CastleMinerZ.exe` and related assemblies
 - applies Harmony patches
 - prints a startup summary
 - starts the server and enters the update loop
 
-### `LidgrenServer.cs`
-The dedicated networking host.
+### `CMZDedicatedLidgrenServer`
+The direct-IP / Lidgren dedicated host.
 
 It is responsible for:
 - binding the socket
 - connection approval
-- session startup
 - direct-IP traffic handling
-- channel 0 / channel 1 packet handling
-- relay of gameplay and bootstrap messages
+- gameplay packet relay
 - player-exists cache/replay for new joiners
 - live connection enumeration for outgoing sends
 - pickup consume relay support
 - authoritative day/time progression and periodic world time broadcasts
 
-### `ServerWorldHandler.cs`
-Host-side world and persistence bridge.
+Key files include:
+- `Hosting/LidgrenServer.cs`
+- `Hosting/ServerRuntime.cs`
+- `World/ServerWorldHandler.cs`
+- `Networking/CmzMessageCodec.cs`
+- `Patching/ServerPatches.cs`
 
-It handles:
-- message ID/type lookup
-- `world.info` loading
-- save device initialization
-- chunk list / chunk request handling
-- terrain mutation handling
-- inventory persistence
-- host-consumed world messages
-- pickup request/create/consume support
-- raw `TimeOfDayMessage` payload construction
+### `CMZDedicatedSteamServer`
+The Steam-based dedicated host.
 
-### `CmzMessageCodec.cs`
-Maps CastleMiner Z message IDs to reflected message types and back.
+It is responsible for:
+- Steam dedicated server bootstrap and registration
+- Steam connection approval and peer tracking
+- lobby and Steam networking host flow
+- gameplay packet relay through the reflected game runtime
+- authoritative world hosting and persistence
 
-### `ServerConfig.cs`
-Loads typed config values from `server.properties`.
+Key files include:
+- `Hosting/SteamDedicatedServer.cs`
+- `Hosting/SteamLobbyHost.cs`
+- `Hosting/SteamConnectionApproval.cs`
+- `Hosting/SteamPeerRegistry.cs`
+- `Steam/SteamServerBootstrap.cs`
+- `World/ServerWorldHandler.cs`
+- `Networking/CmzMessageCodec.cs`
+
+### Shared responsibilities
+Across both hosts, the project still centers around the same core flow:
+- config loading
+- reflected game/runtime loading
+- packet/message translation
+- server-side world persistence
+- inventory/world save handling
+- authoritative time/day progression
 
 ## Requirements
 
@@ -112,7 +166,7 @@ The game files do **not** have to live under a folder literally named `Game` as 
 
 ## Configuration
 
-The server reads configuration from `server.properties` in the server root.
+Each dedicated host reads configuration from `server.properties` in its server root.
 
 Example:
 
@@ -141,21 +195,21 @@ difficulty=1
 ### Config fields
 
 | Key | Purpose |
-|---|---|
-| `server-name` | Display name shown to clients |
-| `game-name` | Expected network game name |
-| `network-version` | Expected protocol version |
-| `game-path` | Optional path to the CastleMiner Z binaries folder; defaults to `./game` when omitted |
-| `server-ip` | Bind address (`0.0.0.0` or `any` binds all interfaces) |
-| `server-port` | Port clients connect to |
-| `max-players` | Maximum connected players |
-| `steam-user-id` | Save-device / world key identity used for storage access |
-| `world-guid` | GUID used to locate the world folder |
-| `view-distance-chunks` | Chunk radius used by the host |
-| `tick-rate-hz` | Server update loop rate |
-| `game-mode` | Session game mode value |
-| `pvp-state` | Session PVP state value |
-| `difficulty` | Session difficulty value |
+|------------------------|--------------------------------------------------------------------------------------------------------|
+| `server-name`          | Display name shown to clients                                                                          |
+| `game-name`            | Expected network game name                                                                             |
+| `network-version`      | Expected protocol version                                                                              |
+| `game-path`            | Optional path to the CastleMiner Z binaries folder; falls back to the local server layout when omitted |
+| `server-ip`            | Bind address (`0.0.0.0` or `any` binds all interfaces)                                                 |
+| `server-port`          | Port clients connect to                                                                                |
+| `max-players`          | Maximum connected players                                                                              |
+| `steam-user-id`        | Save-device / world key identity used for storage access                                               |
+| `world-guid`           | GUID used to locate the world folder                                                                   |
+| `view-distance-chunks` | Chunk radius used by the host                                                                          |
+| `tick-rate-hz`         | Server update loop rate                                                                                |
+| `game-mode`            | Session game mode value                                                                                |
+| `pvp-state`            | Session PVP state value                                                                                |
+| `difficulty`           | Session difficulty value                                                                               |
 
 ## Building
 
@@ -167,43 +221,63 @@ build.bat
 
 This script:
 - locates MSBuild using `vswhere`
-- restores and builds the solution
-- collects release files
-- creates a zip package
+- restores and builds the dedicated-server solution
+- writes output into the shared root `Build` folder
+- keeps the Steam and Lidgren outputs separated into their own build folders
+
+Expected build output:
+
+```text
+Build/
+├─ CMZDedicatedSteamServer/
+└─ CMZDedicatedLidgrenServer/
+```
 
 ### Option 2: Build from Visual Studio / MSBuild
 
 Solution:
 
 ```text
-src/CMZServerHost.sln
+src/CMZDedicatedServers.sln
 ```
 
-Project file:
+Project files:
 
 ```text
-src/CMZServerHost/CMZServerHost.csproj
+src/CMZDedicatedSteamServer/CMZDedicatedSteamServer.csproj
+src/CMZDedicatedLidgrenServer/CMZDedicatedLidgrenServer.csproj
 ```
 
 Important project settings:
 - Target framework: `net481`
 - Platform target: `x86`
-- Output path: `build\ServerHost\`
-- Harmony copied to `build\ServerHost\libs\0Harmony.dll`
+- Shared build root: `Build\`
+- Steam host output path: `Build\CMZDedicatedSteamServer\`
+- Lidgren host output path: `Build\CMZDedicatedLidgrenServer\`
 
 ## Running
 
-After building, run:
+After building, run the host you want to use.
+
+### Steam host
 
 ```bat
-src\CMZServerHost\build\ServerHost\CMZServerHost.exe
+Build\CMZDedicatedSteamServer\CMZDedicatedSteamServer.exe
 ```
+
+### Lidgren host
+
+```bat
+Build\CMZDedicatedLidgrenServer\CMZDedicatedLidgrenServer.exe
+```
+
+You can also use the included per-host helper scripts under each project's `ServerHost` folder if you prefer to maintain a host-specific runtime layout.
 
 On startup the server prints a summary similar to:
 
 ```text
-CMZ Server Host
----------------
+CMZ Dedicated Server
+--------------------
 GameName         : CastleMinerZSteam
 NetworkVersion   : 4
 Bind             : 0.0.0.0:61903
@@ -224,30 +298,36 @@ Then connect using the server IP and the configured `server-port`.
 ### Game folder
 The server needs access to the real CastleMiner Z binaries and content.
 
-By default it looks for them under:
-
-```text
-build\ServerHost\game\
-```
-
-But you can point it somewhere else with `game-path`, for example:
+Each host can be pointed at the real game install using `game-path`, for example:
 
 ```properties
 game-path=C:\Program Files (x86)\Steam\steamapps\common\CastleMiner Z
 ```
 
+If you prefer a local runtime layout instead, the host-specific `ServerHost\Game\` folders can be used as the local game-content location.
+
 ### Harmony
-`0Harmony.dll` is expected under:
+`0Harmony.dll` is expected under the host's local `Libs` folder/runtime layout.
+
+Examples:
 
 ```text
-build\ServerHost\libs\0Harmony.dll
+src\CMZDedicatedSteamServer\Libs\0Harmony.dll
+src\CMZDedicatedLidgrenServer\Libs\0Harmony.dll
 ```
 
-It does not need to live next to `CMZServerHost.exe`.
+And for local host layouts:
+
+```text
+src\CMZDedicatedSteamServer\ServerHost\Libs\0Harmony.dll
+src\CMZDedicatedLidgrenServer\ServerHost\Libs\0Harmony.dll
+```
+
+It does not need to live next to the executable.
 
 ## World and save data
 
-The host derives the world folder from `world-guid` and expects it under:
+The host derives the world folder from `world-guid` and expects it under the selected host's world storage layout:
 
 ```text
 Worlds\{world-guid}
@@ -258,15 +338,21 @@ Typical files used by the host include:
 - chunk delta data
 - player inventory saves
 
+Both dedicated hosts keep the same general world/save flow even though the repository is now split into two server implementations.
+
 ## Networking notes
 
 The current implementation includes:
-- channel 0 / channel 1 packet handling compatible with the reflected game runtime
+- compatible gameplay packet handling through the reflected game runtime
 - direct send and broadcast wrapper handling
 - player visibility bootstrap via cached/replayed `PlayerExistsMessage`
 - relay of text/chat-style packets and gameplay updates
 - server-side pickup resolution for create/request/consume flow
 - live connection enumeration to avoid stale connection lists on outbound sends
+
+The exact transport/bootstrap behavior differs by host:
+- **CMZDedicatedSteamServer** focuses on Steam hosting/bootstrap flow
+- **CMZDedicatedLidgrenServer** focuses on direct-IP / Lidgren hosting flow
 
 ## Time / day progression
 
@@ -277,28 +363,19 @@ This is important because the server loop may run faster or slower than a normal
 ## Notes and current implementation details
 
 - The server is built around **reflection** rather than direct game project references.
-- The host uses the original game message types and message registry where possible.
+- The hosts use the original game message types and message registry where possible.
 - The server update loop is driven by `tick-rate-hz`.
 - Pickup, inventory, chunk, and terrain flow are now handled server-side well enough for basic dedicated play.
-- The repository includes source plus a ready-to-run `build/ServerHost/` layout.
+- The repository now keeps **Steam** and **Lidgren** as separate projects under one solution.
+- The root build process outputs both hosts into the shared `Build` folder.
 
 ## Troubleshooting
 
 ### The server says the game folder is missing
-Make sure `CastleMinerZ.exe` exists either under the default local folder:
-
-```text
-build\ServerHost\game\
-```
-
-or at the path specified by `game-path`.
+Make sure `CastleMinerZ.exe` exists either in the location specified by `game-path` or in the local host runtime layout you are using.
 
 ### The server says `0Harmony.dll` is missing
-Make sure Harmony exists under:
-
-```text
-build\ServerHost\libs\0Harmony.dll
-```
+Make sure Harmony exists in the expected host `Libs` folder.
 
 ### Clients cannot join
 Check:
@@ -306,9 +383,10 @@ Check:
 - firewall rules
 - that both clients are using the same IP and port
 - `game-name` and `network-version`
+- that you are launching the correct host for the connection flow you want to test
 
 ### The wrong world loads
-Check the `world-guid` value in `server.properties` and verify the folder exists under `Worlds\`.
+Check the `world-guid` value in `server.properties` and verify the folder exists under the selected host's `Worlds\` storage location.
 
 ### Save access fails
 Check that `steam-user-id` is populated correctly, because the current save-device setup still uses it as the storage identity/key seed.
