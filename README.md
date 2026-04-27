@@ -19,6 +19,7 @@ Both hosts load the original game/runtime assemblies through reflection, start a
 - Loads `world.info`, chunk delta data, and player inventories from disk
 - Relays player visibility, movement, text, block edits, chunk requests, pickups, and inventory flow
 - Keeps authoritative day/time progression server-side and periodically broadcasts it to clients
+- Can persist and restore world time between restarts through the built-in RememberTime plugin
 - Supports a configurable bind IP, port, player count, world GUID, view distance, and tick rate
 - Separates the dedicated server implementations into **Steam** and **Lidgren** projects while keeping the shared project flow familiar
 
@@ -466,6 +467,7 @@ Current built-in plugin support includes:
 
 - **Announcements** private join messages and timed global messages
 - **FloodGuard** malicious packet spam protection
+- **RememberTime** per-world time persistence between restarts
 - **RegionProtect** server enforcement
 - block mining / placing protection
 - explosion protection
@@ -669,6 +671,81 @@ Notes:
 - `BlackholeMs` is how long to silently drop packets after the sender exceeds the limit.
 - `AllowedPlayers` bypasses FloodGuard for trusted players or test accounts.
 
+## RememberTime Server Plugin
+
+The dedicated servers include a built-in **RememberTime** plugin that saves the server's authoritative day/time value and restores it when the server starts again.
+
+RememberTime can:
+
+- save the current authoritative server time on a configurable interval
+- restore the saved time when the server process starts
+- save one final time during clean server shutdown
+- store saved time per world so different worlds keep separate day/time progress
+- reduce disk writes by using `SaveIntervalSeconds` instead of writing every tick
+
+### Config location
+
+RememberTime creates a shared plugin config and per-world state file beside each dedicated server executable.
+
+For the Steam dedicated server:
+
+```text
+CMZDedicatedSteamServer/
+└─ Plugins/
+   └─ RememberTime/
+      ├─ RememberTime.Config.ini
+      └─ Worlds/
+         └─ <world-guid>/
+            └─ Time.State.ini
+```
+
+For the Lidgren dedicated server:
+
+```text
+CMZDedicatedLidgrenServer/
+└─ Plugins/
+   └─ RememberTime/
+      ├─ RememberTime.Config.ini
+      └─ Worlds/
+         └─ <world-guid>/
+            └─ Time.State.ini
+```
+
+### Example config
+
+```ini
+[General]
+Enabled = true
+
+# Saves the server's current day/time every X seconds.
+# Higher values reduce disk writes.
+# Lower values reduce lost time if the server crashes.
+SaveIntervalSeconds = 60
+
+# Restores the saved time when the server process starts.
+RestoreOnStartup = true
+
+# Writes one final time when the server stops cleanly.
+SaveOnShutdown = true
+```
+
+### Example saved state
+
+```ini
+[State]
+TimeOfDay = 12.4135227
+DisplayDay = 13
+SavedUtc = 2026-04-27T18:20:31.0000000Z
+Reason = interval
+```
+
+### Notes
+
+- `TimeOfDay` is the full server day/time float, not only the `0.0` to `1.0` visual time fraction.
+- Example: `12.41` means the server is on display **Day 13** at roughly the same visual time as `0.41`.
+- `SaveIntervalSeconds = 60` is a good default for normal hosting.
+- If the process crashes, the server may lose up to the configured interval. Clean shutdowns still write one final save when `SaveOnShutdown = true`.
+- The saved time affects dynamic `{day}` and `{day00}` tokens after restore because those tokens use the authoritative server time.
 
 ## Troubleshooting
 
