@@ -19,6 +19,7 @@ Both hosts load the original game/runtime assemblies through reflection, start a
 - Loads `world.info`, chunk delta data, and player inventories from disk
 - Relays player visibility, movement, text, block edits, chunk requests, pickups, and inventory flow
 - Keeps authoritative day/time progression server-side and periodically broadcasts it to clients
+- Automatically respawns all players in Endurance mode when every real connected player is dead, preventing dedicated servers from getting stuck on "Waiting for host to restart"
 - Can persist and restore world time between restarts through the built-in RememberTime plugin
 - Supports a configurable bind IP, port, player count, world GUID, view distance, and tick rate
 - Separates the dedicated server implementations into **Steam** and **Lidgren** projects while keeping the shared project flow familiar
@@ -200,7 +201,7 @@ Example:
 
 ```properties
 server-name=Test Server | Day {day}
-````
+```
 
 This may appear in the server browser or join/session info as:
 
@@ -295,7 +296,7 @@ For **CMZDedicatedSteamServer**, the resolved message is published through the S
 | `world-guid`           | GUID used to locate the world folder                                                                                        |
 | `view-distance-chunks` | Chunk radius used by the host                                                                                               |
 | `tick-rate-hz`         | Server update loop rate                                                                                                     |
-| `game-mode`            | Session game mode value                                                                                                     |
+| `game-mode`            | Session game mode value. Within Endurance; when all players are dead, the server automatically sends a restart message.     |
 | `pvp-state`            | Session PVP state value                                                                                                     |
 | `difficulty`           | Session difficulty value                                                                                                    |
 
@@ -448,6 +449,27 @@ The dedicated host advances world time using **real elapsed time** rather than f
 
 This is important because the server loop may run faster or slower than a normal 60 FPS client host. The current implementation keeps authoritative day progression on the server and periodically broadcasts the current world day/time to clients.
 
+## Endurance auto-respawn behavior
+
+When `game-mode=0` is used, CastleMiner Z's normal Endurance flow expects the original host player to restart the level after everyone dies.
+
+Dedicated servers do not have a real playable host sitting on the death screen, so players could otherwise remain stuck on:
+
+```text
+Waiting for host to restart
+```
+
+To prevent this, the dedicated host tracks the dead/alive state of real connected players. When every real player is dead, the server automatically sends the vanilla restart/respawn message to connected clients.
+
+This does **not** restart the dedicated server process and does **not** intentionally reset the world back to Day 1. After the respawn message is sent, the server continues using its authoritative day/time value and broadcasts that time back to clients.
+
+Notes:
+
+* This behavior only applies to `game-mode=0` / Endurance.
+* The synthetic dedicated-server host/player is ignored and does not count as an alive player.
+* The world save, chunks, inventories, and server process remain active.
+* If the client briefly appears to reset its local day display, the server's authoritative time broadcast corrects it.
+
 ## Notes and current implementation details
 
 - The server is built around **reflection** rather than direct game project references.
@@ -577,7 +599,7 @@ CMZDedicatedLidgrenServer/
       └─ Worlds/
          └─ <world-guid>/
             └─ RegionProtect.Regions.ini
-````
+```
 
 For the Steam dedicated server:
 
