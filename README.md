@@ -23,6 +23,7 @@ Both hosts load the original game/runtime assemblies through reflection, start a
 - Can persist and restore world time between restarts through the built-in RememberTime plugin
 - Supports a configurable bind IP, port, player count, world GUID, view distance, and tick rate
 - Separates the dedicated server implementations into **Steam** and **Lidgren** projects while keeping the shared project flow familiar
+- Includes server-side Player Enforcement commands for listing players, hard-kicking, banning, unbanning, and viewing saved bans
 
 ## Project layout
 
@@ -443,6 +444,37 @@ The exact transport/bootstrap behavior differs by host:
 - **CMZDedicatedSteamServer** focuses on Steam hosting/bootstrap flow
 - **CMZDedicatedLidgrenServer** focuses on direct-IP / Lidgren hosting flow
 
+## Player Enforcement
+
+Both dedicated hosts include basic console-based player enforcement.
+
+Supported commands:
+
+| Command                  | Description                    |
+|--------------------------|--------------------------------|
+| `players`                | Lists connected players.       |
+| `bans`                   | Lists saved bans.              |
+| `kick <target> [reason]` | Hard-kicks a connected player. |
+| `ban <target> [reason]`  | Bans and hard-drops a player.  |
+| `unban <target>`         | Removes a saved ban.           |
+
+Examples:
+
+```text
+players
+bans
+kick 2 Being annoying
+ban 2 Griefing protected areas
+ban "Jacob Smith" Griefing protected areas
+unban jacob
+````
+
+Steam bans are SteamID-backed and also save the last known player name for readability.
+
+Lidgren bans are IP/name-backed and are useful for direct-IP hosting, but they are weaker than SteamID bans because names and IP addresses can change.
+
+Player Enforcement uses a hard drop / transport-level removal path instead of relying only on normal client-side kick messages. This helps prevent modified clients from bypassing enforcement by removing the kick-message pipeline.
+
 ## Time / day progression
 
 The dedicated host advances world time using **real elapsed time** rather than fixed loop iterations.
@@ -491,6 +523,7 @@ Current built-in plugin support includes:
 - **FloodGuard** malicious packet spam protection
 - **RememberTime** per-world time persistence between restarts
 - **RegionProtect** server enforcement
+- **Player Enforcement** console commands for `players`, `kick`, `ban`, `unban`, and `bans`
 - block mining / placing protection
 - explosion protection
 - crate item protection
