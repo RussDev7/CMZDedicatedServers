@@ -523,7 +523,7 @@ Current built-in plugin support includes:
 - **FloodGuard** malicious packet spam protection
 - **RememberTime** per-world time persistence between restarts
 - **RegionProtect** server enforcement
-- **Player Enforcement** console commands for `players`, `kick`, `ban`, `unban`, and `bans`
+- Includes server-side **Player Enforcement** commands for listing players, hard-kicking, banning, unbanning, viewing saved bans, managing command ranks, and protecting operators from kick/ban commands
 - block mining / placing protection
 - explosion protection
 - crate item protection
