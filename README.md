@@ -25,6 +25,7 @@ Both hosts load the original game/runtime assemblies through reflection, start a
 - Separates the dedicated server implementations into **Steam** and **Lidgren** projects while keeping the shared project flow familiar
 - Includes server-side Player Enforcement commands for listing players, hard-kicking, banning, unbanning, and viewing saved bans
 - Hardens host authority by validating packet sender identity and blocking client-authored host-only messages such as forced host migration and spoofed kick packets.
+- Logs command usage to dated audit files under `Logs\commands-yyyy-MM-dd.log` when `log-command-audit=true`.
 
 ## Project layout
 
@@ -476,7 +477,7 @@ kick 2 Being annoying
 ban 2 Griefing protected areas
 ban "Jacob Smith" Griefing protected areas
 unban jacob
-````
+```
 
 Steam bans are SteamID-backed and also save the last known player name for readability.
 
