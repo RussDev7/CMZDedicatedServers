@@ -24,6 +24,7 @@ Both hosts load the original game/runtime assemblies through reflection, start a
 - Supports a configurable bind IP, port, player count, world GUID, view distance, and tick rate
 - Separates the dedicated server implementations into **Steam** and **Lidgren** projects while keeping the shared project flow familiar
 - Includes server-side Player Enforcement commands for listing players, hard-kicking, banning, unbanning, and viewing saved bans
+- Hardens host authority by validating packet sender identity and blocking client-authored host-only messages such as forced host migration and spoofed kick packets.
 
 ## Project layout
 
@@ -443,6 +444,14 @@ The current implementation includes:
 The exact transport/bootstrap behavior differs by host:
 - **CMZDedicatedSteamServer** focuses on Steam hosting/bootstrap flow
 - **CMZDedicatedLidgrenServer** focuses on direct-IP / Lidgren hosting flow
+
+## Packet security / host authority
+
+Both dedicated hosts validate packet sender identity before relaying gameplay packets. Client-declared sender ids must match the actual connected peer assigned by the server.
+
+The hosts also block client-authored host-only packets, including forced host migration and spoofed kick-style packets. This keeps host authority on the dedicated server instead of allowing a modified peer to appoint itself as host or remove other players.
+
+This protection is built in and has no required configuration.
 
 ## Player Enforcement
 
