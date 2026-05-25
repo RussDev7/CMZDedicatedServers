@@ -27,6 +27,8 @@ Both hosts load the original game/runtime assemblies through reflection, start a
 - Hardens host authority by validating packet sender identity and blocking client-authored host-only messages such as forced host migration and spoofed kick packets.
 - Logs command usage to dated audit files under `Logs\commands-yyyy-MM-dd.log` when `log-command-audit=true`.
 - Includes a built-in VanillaSpawners plugin that can prevent new vanilla spawner blocks and random vanilla loot blocks from generating, while optionally blocking existing spawner activation.
+- Supports configurable command prefix aliases such as `!` and `/` for in-game server commands.
+- Supports escaped multiline Announcements plugin messages using `\n`.
 
 ## Project layout
 
@@ -552,6 +554,7 @@ Announcements can:
 
 - send a private welcome message to each joining player
 - send a timed global message to all connected players
+- split configured messages into multiple chat lines using escaped `\n`
 - wait a configurable amount of time before the first global message
 - require a minimum number of online players before global messages are sent
 - reload its config from disk using the server console `reload` command, if enabled by the host
@@ -584,11 +587,11 @@ Enabled = true
 
 [Join]
 PrivateJoinMessageEnabled = true
-PrivateJoinMessage = Welcome {player}! This is a CastleForge dedicated server. Join us: dsc.gg/cforge
+PrivateJoinMessage = Welcome {player}! This is a CastleForge dedicated server. Join us: dsc.gg/cforge\nUse '/help' or '!help' for available commands.
 
 [Global]
 TimedGlobalMessageEnabled = true
-GlobalMessage = Need help, updates, or mods? Join the CastleForge Discord: dsc.gg/cforge
+GlobalMessage = Need help, updates, or mods? Join the CastleForge Discord: dsc.gg/cforge\nCurrent players: {players}/{maxplayers}
 InitialGlobalDelaySeconds = 120
 GlobalMessageIntervalMinutes = 15
 MinimumPlayersForGlobalMessage = 1
@@ -606,6 +609,35 @@ Announcement messages support simple runtime tokens:
 | `{time}`       | Current local server time.       | `8:30 PM`    |
 | `{date}`       | Current local server date.       | `2026-04-26` |
 
+### Multiline messages
+
+Announcement messages can use escaped `\n` to split one config value into multiple chat lines.
+
+Example:
+
+```ini
+PrivateJoinMessage = Welcome {player}!\nUse '/help' or '!help' for available commands.
+GlobalMessage = Join the CastleForge Discord: dsc.gg/cforge\nPlayers online: {players}/{maxplayers}
+```
+
+The server sends each line as a separate chat message.
+
+Example private join output:
+
+```text
+Welcome RussDev7!
+Use '/help' or '!help' for available commands.
+```
+
+Example global output:
+
+```text
+Join the CastleForge Discord: dsc.gg/cforge
+Players online: 3/32
+```
+
+Physical multiline INI values are not required. Keep the message on one config line and use `\n` where a line break should appear.
+
 ### Behavior
 
 The private join message is sent only to the joining player.
@@ -613,6 +645,12 @@ The private join message is sent only to the joining player.
 The timed global message is broadcast to all connected players after `InitialGlobalDelaySeconds`, then repeats every `GlobalMessageIntervalMinutes`.
 
 Set `MinimumPlayersForGlobalMessage = 0` to allow global messages even when the server is empty, or set it to `1` or higher to only announce when players are online.
+
+Notes:
+
+* `\n` is decoded by the Announcements plugin and sent as separate chat lines.
+* Empty multiline entries are skipped.
+* Multiline support applies to both `PrivateJoinMessage` and `GlobalMessage`.
 
 ## RegionProtect Server Plugin
 
@@ -761,7 +799,7 @@ CMZDedicatedSteamServer/
 └─ Plugins/
    └─ VanillaSpawners/
       └─ VanillaSpawners.Config.ini
-````
+```
 
 For the Lidgren dedicated server:
 
