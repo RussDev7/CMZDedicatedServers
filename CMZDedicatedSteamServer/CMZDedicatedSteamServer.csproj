@@ -62,4 +62,8 @@
       <TargetPath>steam_appid.txt</TargetPath>
     </None>
   </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CMZDedicatedServer.PluginAPI\CMZDedicatedServer.PluginAPI.csproj" />
+  </ItemGroup>
 </Project>

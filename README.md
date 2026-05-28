@@ -29,6 +29,9 @@ Both hosts load the original game/runtime assemblies through reflection, start a
 - Includes a built-in VanillaSpawners plugin that can prevent new vanilla spawner blocks and random vanilla loot blocks from generating, while optionally blocking existing spawner activation.
 - Supports configurable command prefix aliases such as `!` and `/` for in-game server commands.
 - Supports escaped multiline Announcements plugin messages using `\n`.
+- Supports external server plugin DLLs under each host's `Plugins` folder, with optional per-plugin `Dependencies` folders.
+- Includes a shared `CMZDedicatedServer.PluginAPI` project for transport-neutral plugin contracts.
+- RegionProtect supports name-based allow-lists and SteamID64 allow-lists on the Steam dedicated server.
 
 ## Project layout
 
@@ -43,6 +46,15 @@ CMZDedicatedServers/
 │  ├─ CMZDedicatedSteamServer/
 │  └─ CMZDedicatedLidgrenServer/
 ├─ CMZDedicatedServers.sln
+├─ CMZDedicatedServer.PluginAPI/
+│  ├─ CMZDedicatedServer.PluginAPI.csproj
+│  └─ Plugins/
+│     └─ ServerPluginContracts.cs
+├─ Shared/
+│  └─ Plugins/
+│     └─ Example/
+│        ├─ Example.csproj
+│        └─ ServerExamplePlugin.cs
 ├─ CMZDedicatedLidgrenServer/
 │  ├─ CMZDedicatedLidgrenServer.csproj
 │  ├─ Program.cs
@@ -152,6 +164,21 @@ Key files include:
 - `Steam/SteamServerBootstrap.cs`
 - `World/ServerWorldHandler.cs`
 - `Networking/CmzMessageCodec.cs`
+
+### `CMZDedicatedServer.PluginAPI`
+The shared plugin API project contains transport-neutral server plugin contracts and context types used by both dedicated hosts.
+
+It is intended for external and shared server plugins to reference without depending on Steam-only or Lidgren-only internals.
+
+### `Shared/Plugins`
+The shared plugin source tree can hold reusable plugin projects that target both hosts.
+
+A plugin under `Shared/Plugins/<PluginName>/` can build once and copy its output into both:
+
+```text
+Build\CMZDedicatedSteamServer\Plugins\<PluginName>\
+Build\CMZDedicatedLidgrenServer\Plugins\<PluginName>\
+```
 
 ### Shared responsibilities
 Across both hosts, the project still centers around the same core flow:
@@ -325,7 +352,15 @@ Expected build output:
 ```text
 Build/
 ├─ CMZDedicatedSteamServer/
+│  ├─ CastleForge.ServerPluginAPI.dll
+│  └─ Plugins/
+│     └─ Example/
+│        └─ Example.dll
 └─ CMZDedicatedLidgrenServer/
+   ├─ CastleForge.ServerPluginAPI.dll
+   └─ Plugins/
+      └─ Example/
+         └─ Example.dll
 ```
 
 ### Option 2: Build from Visual Studio / MSBuild
@@ -341,6 +376,8 @@ Project files:
 ```text
 src/CMZDedicatedSteamServer/CMZDedicatedSteamServer.csproj
 src/CMZDedicatedLidgrenServer/CMZDedicatedLidgrenServer.csproj
+src/CMZDedicatedServer.PluginAPI/CMZDedicatedServer.PluginAPI.csproj
+src/Shared/Plugins/Example/Example.csproj
 ```
 
 Important project settings:
@@ -349,6 +386,8 @@ Important project settings:
 - Shared build root: `Build\`
 - Steam host output path: `Build\CMZDedicatedSteamServer\`
 - Lidgren host output path: `Build\CMZDedicatedLidgrenServer\`
+- Shared plugin API project: `CMZDedicatedServer.PluginAPI`
+- Shared plugin source projects: `Shared\Plugins\<PluginName>\`
 
 ## Running
 
@@ -419,6 +458,24 @@ src\CMZDedicatedLidgrenServer\ServerHost\Libs\0Harmony.dll
 ```
 
 It does not need to live next to the executable.
+
+### Server plugin API
+External server plugins reference the shared plugin API assembly.
+
+For public/release builds, the intended friendly DLL name is:
+
+```text
+CastleForge.ServerPluginAPI.dll
+```
+
+This file should live beside each dedicated server executable:
+
+```text
+Build\CMZDedicatedSteamServer\CastleForge.ServerPluginAPI.dll
+Build\CMZDedicatedLidgrenServer\CastleForge.ServerPluginAPI.dll
+```
+
+Do not copy a separate copy of the API DLL into each plugin's `Dependencies` folder. Keeping one shared API assembly loaded by the server avoids plugin type identity problems.
 
 ## World and save data
 
@@ -523,12 +580,18 @@ Notes:
 - Pickup, inventory, chunk, and terrain flow are now handled server-side well enough for basic dedicated play.
 - The repository now keeps **Steam** and **Lidgren** as separate projects under one solution.
 - The root build process outputs both hosts into the shared `Build` folder.
+- External plugin DLLs are loaded after the built-in plugins are registered, then all registered plugins are initialized together.
 
 ## Server Plugins
 
-CastleForge Dedicated Servers now include basic **server-side plugin support** for host-authoritative world protections and future server extensions.
+CastleForge Dedicated Servers include **server-side plugin support** for host-authoritative world protections, server automation, and future server extensions.
 
 Plugins run inside the dedicated server process and can inspect selected host/world packets before the server applies or relays them. This allows the server to enforce rules even when connecting players do **not** have the matching client-side mod installed.
+
+Both hosts support two plugin styles:
+
+- **Built-in plugins** compiled directly into the dedicated server build and registered by the host at startup.
+- **External plugin DLLs** loaded from each server's runtime `Plugins` folder.
 
 Current built-in plugin support includes:
 
@@ -536,7 +599,7 @@ Current built-in plugin support includes:
 - **FloodGuard** malicious packet spam protection
 - **RememberTime** per-world time persistence between restarts
 - **RegionProtect** server enforcement
-- Includes server-side **Player Enforcement** commands for listing players, hard-kicking, banning, unbanning, viewing saved bans, managing command ranks, and protecting operators from kick/ban commands
+- **Player Enforcement** commands for listing players, hard-kicking, banning, unbanning, viewing saved bans, managing command ranks, and protecting operators from kick/ban commands
 - **VanillaSpawners** vanilla spawner and random loot block generation controls
 - block mining / placing protection
 - explosion protection
@@ -544,7 +607,94 @@ Current built-in plugin support includes:
 - crate break protection
 - per-world plugin configuration
 
-> Server plugins are currently compiled into the dedicated server build. External plugin DLL loading may be added later.
+### Plugin API
+
+External plugins should reference the shared server plugin API project:
+
+```text
+CMZDedicatedServer.PluginAPI
+```
+
+The public runtime assembly is intended to be copied beside each dedicated server executable:
+
+```text
+Build\CMZDedicatedSteamServer\CastleForge.ServerPluginAPI.dll
+Build\CMZDedicatedLidgrenServer\CastleForge.ServerPluginAPI.dll
+```
+
+If your local project file still outputs `CMZDedicatedServer.PluginAPI.dll`, either rename the project `AssemblyName` to `CastleForge.ServerPluginAPI` or adjust the runtime/docs to use the technical DLL name consistently.
+
+The plugin API contains the transport-neutral contracts and context types used by both hosts, such as:
+
+- `IServerPlugin`
+- `IServerWorldPlugin`
+- `IServerInboundPacketPlugin`
+- `IServerPlayerEventPlugin`
+- `IServerTickPlugin`
+- `IServerShutdownPlugin`
+- `ServerPluginContext`
+- `HostMessageContext`
+- `ServerInboundPacketContext`
+- `ServerPlayerEventContext`
+
+Shared plugins should depend on these server callbacks, not on Steam-only or Lidgren-only transport internals.
+
+### External plugin DLL layout
+
+External plugins are loaded from the host's runtime `Plugins` folder.
+
+Example:
+
+```text
+Build/
+├─ CMZDedicatedSteamServer/
+│  ├─ CMZDedicatedSteamServer.exe
+│  ├─ CastleForge.ServerPluginAPI.dll
+│  └─ Plugins/
+│     └─ Example/
+│        ├─ Example.dll
+│        └─ Dependencies/
+│           └─ SomeDependency.dll
+└─ CMZDedicatedLidgrenServer/
+   ├─ CMZDedicatedLidgrenServer.exe
+   ├─ CastleForge.ServerPluginAPI.dll
+   └─ Plugins/
+      └─ Example/
+         ├─ Example.dll
+         └─ Dependencies/
+            └─ SomeDependency.dll
+```
+
+Dependency DLLs are optional. If a plugin has no extra DLL dependencies, the `Dependencies` folder is not required.
+
+### Shared plugin source layout
+
+Reusable plugins that target both hosts can live under:
+
+```text
+Shared/
+└─ Plugins/
+   └─ Example/
+      ├─ Example.csproj
+      └─ ServerExamplePlugin.cs
+```
+
+Each shared plugin project can build once and copy its output into both dedicated server runtime folders:
+
+```text
+Build\CMZDedicatedSteamServer\Plugins\Example\Example.dll
+Build\CMZDedicatedLidgrenServer\Plugins\Example\Example.dll
+```
+
+### Reload behavior
+
+The server `reload` command can reload runtime-safe config and plugin state, but it should not be treated as a DLL hot-reload system.
+
+On .NET Framework, plugin assemblies loaded into the default AppDomain cannot be unloaded cleanly. Adding, removing, or replacing plugin DLLs requires a dedicated server restart.
+
+### Trust model
+
+External server plugins run in the same process as the dedicated server. Only install plugins from trusted sources, because a plugin can read files, write files, send network messages, or crash the server process.
 
 ## Announcements Server Plugin
 
@@ -717,16 +867,20 @@ LogDenied              = true
 
 Each world has its own `RegionProtect.Regions.ini` file:
 
+`AllowedPlayers` accepts player display names. On the Steam dedicated server, `AllowedSteamIds` also accepts SteamID64 values for stable identity-based allow-lists.
+
 ```ini
 [SpawnProtection]
-Enabled        = true
-Range          = 64
-AllowedPlayers = RussDev7
+Enabled         = true
+Range           = 64
+AllowedPlayers  = RussDev7
+AllowedSteamIds = 76561198XXXXXXXXX
 
 [Region:SpawnTown]
-Min            = -80,0,-80
-Max            = 80,120,80
-AllowedPlayers = RussDev7,SomeAdmin
+Min             = -80,0,-80
+Max             = 80,120,80
+AllowedPlayers  = RussDev7,SomeAdmin
+AllowedSteamIds = 76561198XXXXXXXXX,76561198XXXXXXXXX
 ```
 
 ### Player warning behavior
@@ -746,6 +900,10 @@ In some cases, the client may briefly show a block as broken or changed. The ser
 * Commands such as `/regionpos` and `/regioncreate` are not currently part of the dedicated server plugin.
 * Regions are currently edited manually through the `.ini` files.
 * Explosion restoration can visually desync on the attacking client, but protected explosion damage is not saved to the server.
+* On the Steam dedicated server, prefer `AllowedSteamIds` for trusted players/admins because SteamID64 is stable across display-name changes.
+* On the Lidgren dedicated server, RegionProtect allow-lists are effectively name-based.
+* Existing `RegionProtect.Regions.ini` files are not automatically rewritten with new keys. Add `AllowedSteamIds =` manually or regenerate the file if you want the new example format.
+* `AllowedSteamIds` expects numeric SteamID64 values, not Steam profile names or vanity URLs.
 
 ## FloodGuard plugin
 
