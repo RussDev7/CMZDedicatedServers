@@ -6,6 +6,7 @@ This file is part of https://github.com/RussDev7/CMZDedicatedServers - see LICEN
 
 using CMZDedicatedLidgrenServer.Plugins;
 using System.Runtime.CompilerServices;
+using CMZDedicatedServer.Plugins;
 using System.Collections.Generic;
 using System.Reflection;
 using System.Text;
@@ -75,7 +76,41 @@ namespace CMZDedicatedLidgrenServer
         private readonly string _gamePath = gamePath ?? throw new ArgumentNullException(nameof(gamePath));
 
         /// <summary>Logging callback supplied by the host.</summary>
-        private readonly Action<string> _log = log ?? (_ => { });
+        private readonly Action<string> _log = CreateLog(logHostMessages, log);
+
+        /// <summary>Markers that keep a 'ServerWorld:' line visible without verbose logging.</summary>
+        private static readonly string[] AlwaysShowMarkers =
+        {
+            "inner", "not found", "warn", "unread", "fail", "invalid", "ignore",
+            "error", "null", "requir", "cannot", "denied", "reject", "except",
+            "empty", "skipp", "missing", "final",
+        };
+
+        private static Action<string> CreateLog(bool verboseEnabled, Action<string> sink)
+        {
+            sink ??= _ => { };
+            return msg =>
+            {
+                if (verboseEnabled || !IsRoutineMessage(msg))
+                    sink(msg);
+            };
+        }
+
+        private static bool IsRoutineMessage(string msg)
+        {
+            if (string.IsNullOrEmpty(msg))
+                return false;
+            if (msg.StartsWith("[HostMsg]", StringComparison.Ordinal))
+                return true;
+            if (!msg.StartsWith("ServerWorld:", StringComparison.Ordinal))
+                return false;
+            foreach (string marker in AlwaysShowMarkers)
+            {
+                if (msg.IndexOf(marker, StringComparison.OrdinalIgnoreCase) >= 0)
+                    return false;
+            }
+            return true;
+        }
 
         /// <summary>Configured radius used by the spawn-based chunk-list builder.</summary>
         private readonly int _viewRadiusChunks = viewRadiusChunks < 2 ? 2 : (viewRadiusChunks > 32 ? 32 : viewRadiusChunks);
@@ -4196,6 +4231,7 @@ namespace CMZDedicatedLidgrenServer
                 TypeName = typeName,
                 SenderId = senderId,
                 SenderName = senderName,
+                RemoteId = 0UL,
                 Payload = data,
 
                 DeserializeGameMessage = DeserializeGameMessage,

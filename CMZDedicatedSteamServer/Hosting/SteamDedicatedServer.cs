@@ -14,6 +14,8 @@ using CMZDedicatedSteamServer.Plugins;
 using CMZDedicatedSteamServer.Common;
 using CMZDedicatedSteamServer.Config;
 using CMZDedicatedSteamServer.Steam;
+using CMZDedicatedSteamServer.Trust;
+using CMZDedicatedServer.Plugins;
 using System.Collections.Generic;
 using System.Collections;
 using System.Reflection;
@@ -50,6 +52,11 @@ namespace CMZDedicatedSteamServer.Hosting
         private readonly string _baseDir = baseDir ?? AppDomain.CurrentDomain.BaseDirectory;
 
         /// <summary>
+        /// Sync object for chat log file writes.
+        /// </summary>
+        private static readonly object ChatLogSync = new object();
+
+        /// <summary>
         /// Loaded Steam dedicated server configuration.
         /// </summary>
         private SteamServerConfig _config = config ?? throw new ArgumentNullException(nameof(config));
@@ -65,6 +72,7 @@ namespace CMZDedicatedSteamServer.Hosting
         /// Logging callback supplied by the host process.
         /// </summary>
         private readonly Action<string> _log = log ?? (_ => { });
+        private bool _restartRequested;
 
         #endregion
 
@@ -130,6 +138,20 @@ namespace CMZDedicatedSteamServer.Hosting
         /// Cleared when a fresh connection approval is accepted.
         /// </summary>
         private readonly HashSet<ulong> _forceDroppedSteamIds = [];
+
+        /// <summary>
+        /// Kicks waiting out their notice delay: the reason text rides the
+        /// reliable channel first, then the transport drop fires in Update.
+        /// </summary>
+        private sealed class PendingDrop
+        {
+            public ConnectedSteamPeer Peer;
+            public string Reason;
+            public DateTime NotBeforeUtc;
+            public bool KickSent;
+        }
+
+        private readonly List<PendingDrop> _pendingDrops = [];
 
         #endregion
 
@@ -207,6 +229,21 @@ namespace CMZDedicatedSteamServer.Hosting
         /// </summary>
         private string _lastPublishedLobbyMessage = string.Empty;
 
+        /// <summary>
+        /// Next time the lobby watchdog asks Steam to re-read our lobby data.
+        /// If the lobby was destroyed server-side, the native owner-mismatch
+        /// check in OnLobbyDataUpdate tears the session down (InSession=false),
+        /// which the watchdog then uses as the signal to recreate the lobby.
+        /// </summary>
+        private DateTime _nextLobbyProbeUtc = DateTime.MinValue;
+
+        /// <summary>
+        /// Next time the watchdog may attempt lobby recreation. The delay keeps
+        /// a failed Steam call from spinning, and gives the very first
+        /// BeginCreateLobby at startup time to complete before any retry.
+        /// </summary>
+        private DateTime _nextLobbyRecreateUtc = DateTime.MinValue;
+
         #endregion
 
         #endregion
@@ -217,6 +254,7 @@ namespace CMZDedicatedSteamServer.Hosting
         /// Gets whether the server is currently running.
         /// </summary>
         public bool IsRunning => _running;
+        public bool RestartRequested => _restartRequested;
 
         #endregion
 
@@ -266,6 +304,7 @@ namespace CMZDedicatedSteamServer.Hosting
                 UnbanPlayer,
                 Reload,
                 ReloadPlugins,
+                RequestRestart,
                 ResolveCommandTarget);
             _lobbyHost = new SteamLobbyHost(
                 _config,
@@ -278,16 +317,23 @@ namespace CMZDedicatedSteamServer.Hosting
             _lastPublishedLobbyMessage = BuildServerDisplayMessage();
             _lastPublishedLobbyName = BuildServerDisplayName();
             _lastPublishedLobbyDay = GetDisplayDay();
+            // Give the initial create time to land before the watchdog may retry.
+            _nextLobbyRecreateUtc = DateTime.UtcNow.AddMinutes(2);
+            _nextLobbyProbeUtc = DateTime.UtcNow.AddMinutes(1);
 
             ulong effectiveSaveOwnerSteamId = _config.SaveOwnerSteamId != 0UL ? _config.SaveOwnerSteamId : _steam.SteamPlayerId;
             if (!string.IsNullOrWhiteSpace(_config.WorldFolder) && effectiveSaveOwnerSteamId != 0UL)
             {
                 _plugins = new ServerPluginManager(_log);
+                _plugins.SetCommandManager(_commands);
+
                 _plugins.Register(new ServerFloodGuardPlugin());
                 _plugins.Register(new ServerRegionProtectPlugin());
                 _plugins.Register(new ServerAnnouncementsPlugin());
                 _plugins.Register(new ServerRememberTimePlugin());
                 _plugins.Register(new ServerVanillaSpawnerPlugin());
+
+                _plugins.LoadExternalPlugins(Path.Combine(_baseDir, "Plugins"));
 
                 _plugins.InitializeAll(new ServerPluginContext
                 {
@@ -312,7 +358,34 @@ namespace CMZDedicatedSteamServer.Hosting
                         // Force lobby metadata to refresh with the restored day.
                         _lastPublishedLobbyDay = -1;
                     },
+
+                    KickPlayer = KickPlayer,
+                    BanPlayer = BanPlayer,
+                    UnbanPlayer = UnbanPlayer,
+                    ExecuteServerCommand = TryExecuteServerCommandFromConsole,
+                    BroadcastMessage = BroadcastServerText
                 });
+
+                ServerPolicy trustPolicy = null;
+                if (_config.TrustEnforcement)
+                {
+                    trustPolicy = new ServerPolicy(
+                        _config,
+                        _log,
+                        _commands.GetRankForPlayer,
+                        KickPlayerWithNotice,
+                        AutoBanPlayer,
+                        BroadcastServerText,
+                        (x, y, z, depth) => _worldHandler != null
+                            ? _worldHandler.ProbeSupport(x, y, z, depth)
+                            : SupportProbeResult.Unknown);
+                    // Kick counts persist on disk (Kicks.ini): restarts reload
+                    // them — they never auto-reset, only a manual wipe clears.
+                    var kickStore = new ServerKickStore(_baseDir, _log);
+                    trustPolicy.SetKickCountStore(kickStore.Load, kickStore.Save);
+                    _log("[Trust] Server-authoritative enforcement enabled (gameMode=" +
+                         _config.GameMode + ", difficulty=" + _config.Difficulty + ").");
+                }
 
                 _worldHandler = new ServerWorldHandler(
                     gamePath,
@@ -324,7 +397,8 @@ namespace CMZDedicatedSteamServer.Hosting
                     _plugins,
                     _config.LogHostMessages,
                     _config.GameMode,
-                    () => _timeOfDay);
+                    () => _timeOfDay,
+                    trustPolicy);
 
                 _worldHandler.Init(_assemblyLoader.GameAssembly, _assemblyLoader.CommonAssembly);
                 _worldHandler.ApplyServerMessage(BuildServerDisplayMessage(), saveToDisk: false);
@@ -338,6 +412,7 @@ namespace CMZDedicatedSteamServer.Hosting
             }
 
             _running = true;
+            _restartRequested = false;
         }
 
         /// <summary>
@@ -353,6 +428,13 @@ namespace CMZDedicatedSteamServer.Hosting
             });
 
             _running = false;
+        }
+
+        public void RequestRestart()
+        {
+            _log("[Server] Restart requested.");
+            _restartRequested = true;
+            Stop();
         }
 
         /// <summary>
@@ -459,17 +541,27 @@ namespace CMZDedicatedSteamServer.Hosting
 
             AdvanceTimeOfDay();
             BroadcastTimeOfDayIfNeeded();
+            BroadcastScheduledDragonIfDue();
+            BroadcastCanaryIfDue();
             RefreshLobbyMetadataIfNeeded();
+            LobbyWatchdog();
 
             // Run optional tick-based plugins, such as Announcements.
             UpdateServerPlugins();
+
+            // Fire any notice-delayed kicks whose text has had time to arrive.
+            ProcessPendingDrops();
 
             bool anyPackets = _steam.Update();
             if (!anyPackets)
                 return;
 
+            // Bound the drain: under a sustained packet flood an unbounded loop
+            // starves everything else in Update (pending kicks, timers, lobby).
+            // Leftover packets are picked up next tick.
             object packet;
-            while ((packet = _steam.GetPacketOrNull()) != null)
+            int drained = 0;
+            while (drained++ < 512 && (packet = _steam.GetPacketOrNull()) != null)
             {
                 try
                 {
@@ -642,6 +734,7 @@ namespace CMZDedicatedSteamServer.Hosting
                     ConnectedSteamPeer newPeer = _peers.AddConnectedPeer(senderSteamId, gid, pending.Gamertag, remoteGamer);
                     _connectionToGamer[senderSteamId] = remoteGamer;
                     _approval.MarkConnected(senderSteamId, pending.Gamertag, remoteGamer);
+                    _commands?.EnsureMemberRankAssigned(senderSteamId, pending.Gamertag);
                     _worldHandler?.ApplyServerMessage(BuildServerDisplayMessage(), saveToDisk: false);
                     PublishCurrentLobbyMetadata();
                     BroadcastNewPeerToOthers(newPeer);
@@ -688,15 +781,95 @@ namespace CMZDedicatedSteamServer.Hosting
         /// </summary>
         private void HandleData(object packet, ulong senderSteamId)
         {
-            int channel = Convert.ToInt32(ReflectEx.GetRequiredMemberValue(packet, "Channel"));
-
-            if (channel == 1)
+            try
             {
-                HandleChannel1Data(packet, senderSteamId);
+                int channel = Convert.ToInt32(ReflectEx.GetRequiredMemberValue(packet, "Channel"));
+
+                if (channel == 1)
+                {
+                    HandleChannel1Data(packet, senderSteamId);
+                    return;
+                }
+
+                HandleChannel0Data(packet, senderSteamId);
+            }
+            catch (Exception ex) when (IsMalformedPacketException(ex))
+            {
+                // Steam's reliable transport delivers whole messages or none,
+                // so a parse-level failure here is a crafted byte stream
+                // (crash-tool floods send bad length prefixes). Drop and
+                // strike the real sender instead of spamming the MainLoop log.
+                NoteMalformedPacket(senderSteamId, "parse failure");
+            }
+        }
+
+        /// <summary>
+        /// True when an exception raised while reading a packet is consistent
+        /// with malformed wire data rather than a server bug.
+        /// </summary>
+        private static bool IsMalformedPacketException(Exception ex)
+        {
+            if (ex is TargetInvocationException tie && tie.InnerException != null)
+                ex = tie.InnerException;
+            return ex is ArgumentException
+                || ex is EndOfStreamException
+                || ex is OutOfMemoryException
+                || ex is OverflowException
+                || ex is IndexOutOfRangeException;
+        }
+
+        /// <summary>
+        /// Reads a declared payload length and verifies it against the packet's
+        /// actual remaining bits before ReadBytes can allocate the buffer.
+        /// Returns false when the packet is malformed.
+        /// </summary>
+        private static bool TryReadDeclaredPayload(object packet, ulong senderSteamId,
+            MethodInfo readInt32, MethodInfo readBytes, out byte[] payloadBytes)
+        {
+            payloadBytes = null;
+
+            int declared = Convert.ToInt32(readInt32.Invoke(packet, null));
+            if (declared < 0)
+                return false;
+
+            if (declared > 0)
+            {
+                long lengthBits = Convert.ToInt64(ReflectEx.GetRequiredMemberValue(packet, "LengthBits"));
+                long positionBits = Convert.ToInt64(ReflectEx.GetRequiredMemberValue(packet, "Position"));
+                if ((long)declared * 8 > lengthBits - positionBits)
+                    return false;
+
+                payloadBytes = (byte[])readBytes.Invoke(packet, [declared]);
+            }
+            else
+            {
+                payloadBytes = [];
+            }
+
+            if (payloadBytes == null)
+                return false;
+
+            return true;
+        }
+
+        /// <summary>
+        /// Attributes a malformed inbound packet to its transport sender and
+        /// feeds it to the trust policy as a protocol violation.
+        /// </summary>
+        private void NoteMalformedPacket(ulong senderSteamId, string detail)
+        {
+            if (_peers == null ||
+                !_peers.TryGetConnectedPeer(senderSteamId, out ConnectedSteamPeer peer) ||
+                peer == null)
+            {
                 return;
             }
 
-            HandleChannel0Data(packet, senderSteamId);
+            _worldHandler?.NotifyMalformedPacket(
+                peer.Gid,
+                detail,
+                () => peer.Gamertag,
+                () => peer.SteamId);
         }
 
         /// <summary>
@@ -717,18 +890,22 @@ namespace CMZDedicatedSteamServer.Hosting
                 object delivery = Enum.ToObject(deliveryType, Convert.ToByte(readByte.Invoke(packet, null)));
                 byte senderId = Convert.ToByte(readByte.Invoke(packet, null));
 
-                int dataSize = Convert.ToInt32(readInt32.Invoke(packet, null));
-                byte[] payloadBytes = dataSize > 0 ? (byte[])readBytes.Invoke(packet, [dataSize]) : [];
-                if (payloadBytes == null)
+                if (!TryReadDeclaredPayload(packet, senderSteamId, readInt32, readBytes, out byte[] payloadBytes))
+                {
+                    NoteMalformedPacket(senderSteamId, "CH1 OP3 bad payload length");
                     return;
+                }
 
                 if (!TryValidateDeclaredSenderId(senderSteamId, senderId, "CH1 OP3"))
                     return;
 
-                if (ShouldDropClientAuthorityPacket(senderId, recipientId, payloadBytes, "CH1 OP3"))
+                if (ShouldDropClientAuthorityPacket(senderId, recipientId, payloadBytes, "CH1 OP3", senderSteamId))
                     return;
 
                 if (ShouldDropInboundPacket(senderId, recipientId, 1, 3, payloadBytes, senderSteamId))
+                    return;
+
+                if (ShouldDropUntrustedRelay(senderId, payloadBytes, senderSteamId, "CH1 OP3", isPeerDirected: true))
                     return;
 
                 if (!TryGetSteamIdForPlayer(recipientId, out ulong recipientSteamId))
@@ -743,18 +920,24 @@ namespace CMZDedicatedSteamServer.Hosting
                 object delivery = Enum.ToObject(deliveryType, Convert.ToByte(readByte.Invoke(packet, null)));
                 byte senderId = Convert.ToByte(readByte.Invoke(packet, null));
 
-                int dataSize = Convert.ToInt32(readInt32.Invoke(packet, null));
-                byte[] payloadBytes = dataSize > 0 ? (byte[])readBytes.Invoke(packet, [dataSize]) : [];
-                if (payloadBytes == null || payloadBytes.Length < 1)
+                if (!TryReadDeclaredPayload(packet, senderSteamId, readInt32, readBytes, out byte[] payloadBytes) ||
+                    payloadBytes.Length < 1)
+                {
+                    if (payloadBytes == null)
+                        NoteMalformedPacket(senderSteamId, "CH1 OP4 bad payload length");
                     return;
+                }
 
                 if (!TryValidateDeclaredSenderId(senderSteamId, senderId, "CH1 OP4"))
                     return;
 
-                if (ShouldDropClientAuthorityPacket(senderId, 0, payloadBytes, "CH1 OP4"))
+                if (ShouldDropClientAuthorityPacket(senderId, 0, payloadBytes, "CH1 OP4", senderSteamId))
                     return;
 
                 if (ShouldDropInboundPacket(senderId, 0, 1, 4, payloadBytes, senderSteamId))
+                    return;
+
+                if (ShouldDropUntrustedRelay(senderId, payloadBytes, senderSteamId, "CH1 OP4", isPeerDirected: false))
                     return;
 
                 if (TryHandleServerChatCommand(senderId, senderSteamId, payloadBytes))
@@ -818,18 +1001,24 @@ namespace CMZDedicatedSteamServer.Hosting
             byte recipientId = Convert.ToByte(readByte.Invoke(packet, null));
             byte senderId = Convert.ToByte(readByte.Invoke(packet, null));
 
-            int len = Convert.ToInt32(readInt32.Invoke(packet, null));
-            byte[] data = len < 0 ? null : (len == 0 ? [] : (byte[])readBytes.Invoke(packet, [len]));
-            if (data == null || data.Length < 1)
+            if (!TryReadDeclaredPayload(packet, senderSteamId, readInt32, readBytes, out byte[] data) ||
+                data.Length < 1)
+            {
+                if (data == null)
+                    NoteMalformedPacket(senderSteamId, "CH0 bad payload length");
                 return;
+            }
 
             if (!TryValidateDeclaredSenderId(senderSteamId, senderId, "CH0"))
                 return;
 
-            if (ShouldDropClientAuthorityPacket(senderId, recipientId, data, "CH0"))
+            if (ShouldDropClientAuthorityPacket(senderId, recipientId, data, "CH0", senderSteamId))
                 return;
 
             if (ShouldDropInboundPacket(senderId, recipientId, 0, 0, data, senderSteamId))
+                return;
+
+            if (ShouldDropUntrustedRelay(senderId, data, senderSteamId, "CH0", isPeerDirected: recipientId != 0))
                 return;
 
             if (TryHandleServerChatCommand(senderId, senderSteamId, data))
@@ -991,12 +1180,42 @@ namespace CMZDedicatedSteamServer.Hosting
                     message = reader.ReadString();
                 }
 
-                return !string.IsNullOrWhiteSpace(message);
+                if (!string.IsNullOrWhiteSpace(message))
+                {
+                    _log($"[Chat] {message}");
+                    AppendChatLogLine(message);
+                    return true;
+                }
+
+                return false;
             }
             catch
             {
                 message = null;
                 return false;
+            }
+        }
+
+        /// <summary>
+        /// Appends one chat log line to Logs\chat-yyyy-MM-dd.log.
+        /// </summary>
+        private void AppendChatLogLine(string line)
+        {
+            try
+            {
+                string logsDir = Path.Combine(_baseDir, "Logs");
+                Directory.CreateDirectory(logsDir);
+
+                string path = Path.Combine(logsDir, "chat-" + DateTime.Now.ToString("yyyy-MM-dd") + ".log");
+
+                lock (ChatLogSync)
+                {
+                    File.AppendAllText(path, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {line}{Environment.NewLine}");
+                }
+            }
+            catch
+            {
+                // Never let logging failures break the dedicated server loop.
             }
         }
 
@@ -1171,7 +1390,7 @@ namespace CMZDedicatedSteamServer.Hosting
         /// <summary>
         /// Drops client-authored messages that only the authoritative dedicated server is allowed to send.
         /// </summary>
-        private bool ShouldDropClientAuthorityPacket(byte senderId, byte recipientId, byte[] payload, string route)
+        private bool ShouldDropClientAuthorityPacket(byte senderId, byte recipientId, byte[] payload, string route, ulong senderSteamId = 0UL)
         {
             if (_codec == null || payload == null || payload.Length < 1)
                 return false;
@@ -1195,7 +1414,68 @@ namespace CMZDedicatedSteamServer.Hosting
 
             _log($"[Security] Dropped client-authored {ShortTypeName(typeName)} from player {senderId}; recipient={recipientId}; route={route}.");
 
+            // Forged host-authority traffic counts as a trust violation; enough
+            // of it kicks. Taking host authority itself is unambiguous - kick now.
+            _worldHandler?.NotifyForgedHostAuthority(
+                senderId,
+                typeName,
+                () => _peers != null && _peers.TryGetConnectedPeer(senderSteamId, out ConnectedSteamPeer p) && p != null ? p.Gamertag : null,
+                () => senderSteamId);
+
+            if (typeName == "DNA.CastleMinerZ.Net.AppointServerMessage" && senderSteamId != 0UL)
+                KickPlayer(senderSteamId.ToString(), "Attempted host takeover.");
+
             return true;
+        }
+
+        /// <summary>
+        /// Runs the trust policy over messages that are about to be relayed to
+        /// peers (combat claims, carried-item claims, detonations). Returns true
+        /// when the packet must be dropped instead of forwarded. isPeerDirected
+        /// distinguishes real peer-routed traffic (CH1 OP3, CH0 nonzero recipient)
+        /// from host-bound payloads that AllowMessage validates separately.
+        /// </summary>
+        private bool ShouldDropUntrustedRelay(byte senderId, byte[] data, ulong senderSteamId, string route, bool isPeerDirected)
+        {
+            if (_worldHandler == null || _codec == null || data == null || data.Length < 1)
+                return false;
+
+            string typeName;
+
+            try
+            {
+                typeName = _codec.GetTypeName(data[0]);
+            }
+            catch
+            {
+                typeName = null;
+            }
+
+            // The codec mirrors the vanilla message registry, so an unresolvable
+            // id is never legitimate traffic - it is crafted data (remote-crash
+            // packets rely on it). Unresolvable payloads relay unchecked, so
+            // drop them rather than forwarding garbage to the victim(s).
+            if (string.IsNullOrWhiteSpace(typeName))
+            {
+                _log($"[Security] Dropped unresolvable message id {data[0]} from player {senderId}; route={route}.");
+                return true;
+            }
+
+            bool allowed = _worldHandler.AllowRelayedMessage(
+                senderId,
+                typeName,
+                data,
+                isPeerDirected,
+                () => _peers != null && _peers.TryGetConnectedPeer(senderSteamId, out ConnectedSteamPeer p) && p != null ? p.Gamertag : null,
+                () => senderSteamId);
+
+            if (!allowed)
+            {
+                _log($"[Security] Dropped untrusted {ShortTypeName(typeName)} from player {senderId}; route={route}.");
+                return true;
+            }
+
+            return false;
         }
 
         /// <summary>
@@ -1211,7 +1491,12 @@ namespace CMZDedicatedSteamServer.Hosting
                 "DNA.CastleMinerZ.Net.ProvideDeltaListMessage"            or
                 "DNA.CastleMinerZ.Net.ProvideChunkMessage"                or
                 "DNA.CastleMinerZ.Net.InventoryRetrieveFromServerMessage" or
-                "DNA.CastleMinerZ.Net.RestartLevelMessage"                => true,
+                "DNA.CastleMinerZ.Net.RestartLevelMessage"                or
+                "DNA.CastleMinerZ.Net.ConsumePickupMessage"               or
+                "DNA.CastleMinerZ.Net.SpawnDragonMessage"                 or
+                "DNA.CastleMinerZ.Net.ExistingDragonMessage"              or
+                "DNA.CastleMinerZ.Net.MigrateDragonMessage"               or
+                "DNA.CastleMinerZ.Net.TimeOfDayMessage"                   => true,
                 _ => false,
             };
         }
@@ -1369,6 +1654,84 @@ namespace CMZDedicatedSteamServer.Hosting
         }
 
         /// <summary>
+        /// Kick variant that first delivers the reason over the reliable text
+        /// channel, then drops the peer after a short delay so the message has
+        /// time to arrive before the transport severs. Trust enforcement uses
+        /// this so kicked players are told why.
+        /// </summary>
+        public bool KickPlayerWithNotice(string target, string reason = null)
+        {
+            if (!TryResolveSteamPeer(target, out ConnectedSteamPeer peer))
+            {
+                _log($"[PlayerEnforcement] Kick failed. Could not find player: {target}");
+                return false;
+            }
+
+            reason = string.IsNullOrWhiteSpace(reason) ? "Kicked from this server." : reason.Trim();
+
+            foreach (PendingDrop pending in _pendingDrops)
+            {
+                if (pending.Peer.SteamId == peer.SteamId)
+                    return true;
+            }
+
+            SendServerTextToPeer(peer, $"[Server] {reason}");
+            _pendingDrops.Add(new PendingDrop
+            {
+                Peer = peer,
+                Reason = reason,
+                NotBeforeUtc = DateTime.UtcNow.AddSeconds(1.25)
+            });
+            return true;
+        }
+
+        private void ProcessPendingDrops()
+        {
+            if (_pendingDrops.Count == 0)
+                return;
+
+            DateTime now = DateTime.UtcNow;
+            for (int i = _pendingDrops.Count - 1; i >= 0; i--)
+            {
+                PendingDrop drop = _pendingDrops[i];
+                if (now < drop.NotBeforeUtc)
+                    continue;
+
+                if (_peers == null || !_peers.TryGetConnectedPeer(drop.Peer.SteamId, out _))
+                {
+                    _pendingDrops.RemoveAt(i);
+                    continue;
+                }
+
+                if (!drop.KickSent)
+                {
+                    // In-protocol kick first: KickMessage is what actually drops
+                    // the client to the kick screen. The transport deny follows
+                    // a beat later so the packet has time to leave the wire.
+                    drop.KickSent = true;
+                    SendKickMessageToPeer(drop.Peer, banned: false);
+                    drop.NotBeforeUtc = now.AddSeconds(0.4);
+                    continue;
+                }
+
+                _pendingDrops.RemoveAt(i);
+                ForceDropSteamPeer(drop.Peer, ban: false, reason: drop.Reason);
+            }
+        }
+
+        private void SendServerTextToPeer(ConnectedSteamPeer peer, string text)
+        {
+            if (peer == null)
+                return;
+
+            byte[] payload = BuildServerTextPayload(text);
+            if (payload == null || payload.Length == 0)
+                return;
+
+            SendChannel0PayloadToSteam(peer.SteamId, peer.Gid, 0, payload, GetReliableOrderedDeliveryMethod());
+        }
+
+        /// <summary>
         /// Force-bans a connected Steam peer, persists the SteamID ban, then drops them.
         /// </summary>
         public bool BanPlayer(string target, string reason = null)
@@ -1380,6 +1743,21 @@ namespace CMZDedicatedSteamServer.Hosting
             }
 
             return ForceDropSteamPeer(peer, ban: true, reason: reason);
+        }
+
+        /// <summary>
+        /// Policy-driven auto-ban: persists an escalating-duration SteamID ban
+        /// (1/3/7/14/30 days then permanent per repeat strike), then drops them.
+        /// </summary>
+        public bool AutoBanPlayer(string target, string reason = null)
+        {
+            if (!TryResolveSteamPeer(target, out ConnectedSteamPeer peer))
+            {
+                _log($"[PlayerEnforcement] Auto-ban failed. Could not find player: {target}");
+                return false;
+            }
+
+            return ForceDropSteamPeer(peer, ban: true, reason: reason, autoEscalate: true);
         }
 
         /// <summary>
@@ -1462,7 +1840,7 @@ namespace CMZDedicatedSteamServer.Hosting
         /// Performs the actual hard kick/ban.
         /// This is the dedicated-server equivalent of CastleWalls Mk2 hard enforcement.
         /// </summary>
-        private bool ForceDropSteamPeer(ConnectedSteamPeer peer, bool ban, string reason)
+        private bool ForceDropSteamPeer(ConnectedSteamPeer peer, bool ban, string reason, bool autoEscalate = false)
         {
             if (peer == null || peer.SteamId == 0UL)
                 return false;
@@ -1472,12 +1850,24 @@ namespace CMZDedicatedSteamServer.Hosting
                 : reason.Trim();
 
             if (ban)
-                _banStore?.BanSteam(peer.SteamId, peer.Gamertag, reason);
+                _banStore?.BanSteam(peer.SteamId, peer.Gamertag, reason, autoEscalate);
 
             _forceDroppedSteamIds.Add(peer.SteamId);
 
+            // In-protocol kick: the client honors KickMessage by dropping to the
+            // kicked/banned screen. The transport deny below is cleanup; alone it
+            // only severs the session server-side and leaves the client running
+            // in a zombie connection until timeout.
+            try
+            {
+                SendKickMessageToPeer(peer, ban);
+            }
+            catch (Exception ex)
+            {
+                _log($"[PlayerEnforcement] KickMessage send failed for {peer.SteamId}: {ex.Message}");
+            }
+
             // Tell the target connection to close on the Steam transport path.
-            // This does not depend on the client-side KickMessage pipeline.
             try
             {
                 _steam?.DenyConnection(peer.SteamId, reason);
@@ -1632,6 +2022,37 @@ namespace CMZDedicatedSteamServer.Hosting
                 {
                     _codec.SetMember(msg, "Message", text ?? string.Empty);
                 });
+        }
+
+        /// <summary>
+        /// Builds a vanilla KickMessage payload ([id][banned][playerId]) - the
+        /// in-protocol disconnect the client honors by dropping to the
+        /// kicked/banned screen.
+        /// </summary>
+        private byte[] BuildKickPayload(byte playerId, bool banned)
+        {
+            if (_codec == null)
+                return null;
+
+            return _codec.BuildPayload(
+                "DNA.CastleMinerZ.Net.KickMessage",
+                msg =>
+                {
+                    _codec.SetMember(msg, "Banned", banned);
+                    _codec.SetMember(msg, "PlayerID", playerId);
+                });
+        }
+
+        private void SendKickMessageToPeer(ConnectedSteamPeer peer, bool banned)
+        {
+            if (peer == null)
+                return;
+
+            byte[] payload = BuildKickPayload(peer.Gid, banned);
+            if (payload == null || payload.Length == 0)
+                return;
+
+            SendChannel0PayloadToSteam(peer.SteamId, peer.Gid, 0, payload, GetReliableOrderedDeliveryMethod());
         }
 
         /// <summary>
@@ -1812,6 +2233,88 @@ namespace CMZDedicatedSteamServer.Hosting
         }
 
         /// <summary>
+        /// Runs the server-driven dragon schedule. Vanilla leaves dragon timing
+        /// to each client's CheckDragonBox -> RequestDragonMessage; the host
+        /// runs the same schedule itself so dragons still appear when clients
+        /// never ask (and it cannot be forged - the payload is built here).
+        /// </summary>
+        private void BroadcastScheduledDragonIfDue()
+        {
+            if (_worldHandler == null)
+                return;
+
+            // Vanilla runs this check every frame on the host; 1 s keeps the
+            // distance threshold feeling near-instant without per-tick churn.
+            if ((DateTime.UtcNow - _lastDragonCheckUtc).TotalSeconds < 1.0)
+                return;
+            _lastDragonCheckUtc = DateTime.UtcNow;
+
+            object reliableOrdered = GetReliableOrderedDeliveryMethod();
+
+            // A controller disconnect leaves an orphaned dragon on every other
+            // client — the pending RemoveDragonMessage goes out first.
+            if (_worldHandler.TryConsumeDragonRemoveBroadcast(out byte[] removePayload) &&
+                removePayload != null)
+            {
+                foreach (ConnectedSteamPeer peer in _peers.GetConnectedPeersSnapshot())
+                    SendChannel0PayloadToSteam(peer.SteamId, peer.Gid, 0, removePayload, reliableOrdered);
+
+                _log("[Dragon] RemoveDragonMessage broadcast for orphaned dragon.");
+            }
+
+            if (!_worldHandler.TryGetScheduledDragonSpawn(
+                    out byte[] payload, out byte controllerId, out byte dragonType) ||
+                payload == null)
+            {
+                return;
+            }
+
+            int sent = 0;
+            foreach (ConnectedSteamPeer peer in _peers.GetConnectedPeersSnapshot())
+            {
+                SendChannel0PayloadToSteam(peer.SteamId, peer.Gid, 0, payload, reliableOrdered);
+                sent++;
+            }
+
+            _log($"[Dragon] Scheduled spawn broadcast. Type={dragonType}, Controller={controllerId}, Recipients={sent}.");
+        }
+
+        private DateTime _lastDragonCheckUtc = DateTime.MinValue;
+
+        /// <summary>
+        /// Canary upkeep rides the same 1 s cadence as the dragon schedule.
+        /// Canary enemies are server-planted unreachable spawns: any client
+        /// kill claim naming one is fabricated by definition (kill-all sweeps
+        /// claim every id in the local enemy list).
+        /// </summary>
+        private void BroadcastCanaryIfDue()
+        {
+            if (_worldHandler == null)
+                return;
+
+            if ((DateTime.UtcNow - _lastCanaryCheckUtc).TotalSeconds < 1.0)
+                return;
+            _lastCanaryCheckUtc = DateTime.UtcNow;
+
+            _canaryPayloadScratch.Clear();
+            _worldHandler.BuildCanaryBroadcasts(_canaryPayloadScratch);
+            if (_canaryPayloadScratch.Count == 0)
+                return;
+
+            object reliableOrdered = GetReliableOrderedDeliveryMethod();
+            foreach (byte[] payload in _canaryPayloadScratch)
+            {
+                if (payload == null || payload.Length == 0)
+                    continue;
+                foreach (ConnectedSteamPeer peer in _peers.GetConnectedPeersSnapshot())
+                    SendChannel0PayloadToSteam(peer.SteamId, peer.Gid, 0, payload, reliableOrdered);
+            }
+        }
+
+        private DateTime _lastCanaryCheckUtc = DateTime.MinValue;
+        private readonly List<byte[]> _canaryPayloadScratch = new List<byte[]>();
+
+        /// <summary>
         /// Sends the current authoritative day value to a newly connected peer.
         /// </summary>
         private void SendInitialTimeOfDayToJoiner(ulong joinerSteamId, byte joinerGid)
@@ -1888,6 +2391,63 @@ namespace CMZDedicatedSteamServer.Hosting
                 message = message.Substring(0, 128);
 
             return message;
+        }
+
+        /// <summary>
+        /// Steam destroys a user's owned lobbies when the client session drops, and
+        /// the native layer never learns that happened — SetLobbyData keeps writing
+        /// to the stale id and fails silently, so the server vanishes from the
+        /// browser while every log line looks healthy. Once a minute we ask Steam
+        /// to re-read our lobby; a dead lobby trips the native owner check in
+        /// OnLobbyDataUpdate, which leaves the lobby and flips InSession to false.
+        /// That is the liveness signal: mark the lobby lost and recreate it a few
+        /// seconds later so the server reappears without a restart.
+        /// </summary>
+        private void LobbyWatchdog()
+        {
+            if (_lobbyHost == null)
+                return;
+
+            DateTime now = DateTime.UtcNow;
+
+            if (!_lobbyHost.IsLobbyReady)
+            {
+                if (now >= _nextLobbyRecreateUtc)
+                {
+                    try
+                    {
+                        _lobbyHost.BeginCreateLobby(BuildServerDisplayName(), BuildServerDisplayMessage());
+                        _log("[SteamLobby] Lobby recreation requested.");
+                    }
+                    catch (Exception ex)
+                    {
+                        _log($"[SteamLobby] Lobby recreation failed: {ex.Message}");
+                    }
+                    _nextLobbyRecreateUtc = now.AddSeconds(30);
+                }
+                return;
+            }
+
+            if (!_lobbyHost.IsSteamSessionAlive)
+            {
+                _log("[SteamLobby] Lobby lost (Steam session ended); recreating.");
+                _lobbyHost.MarkLobbyLost();
+                _nextLobbyRecreateUtc = now.AddSeconds(10);
+                return;
+            }
+
+            if (now >= _nextLobbyProbeUtc)
+            {
+                _nextLobbyProbeUtc = now.AddSeconds(60);
+                try
+                {
+                    _lobbyHost.ProbeLobbyLiveness();
+                }
+                catch (Exception ex)
+                {
+                    _log($"[SteamLobby] Liveness probe failed: {ex.Message}");
+                }
+            }
         }
 
         /// <summary>

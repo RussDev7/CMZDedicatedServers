@@ -12,6 +12,7 @@ using CMZDedicatedLidgrenServer.Plugins.FloodGuard;
 using CMZDedicatedLidgrenServer.Commands;
 using CMZDedicatedLidgrenServer.Hosting;
 using CMZDedicatedLidgrenServer.Plugins;
+using CMZDedicatedServer.Plugins;
 using System.Collections.Generic;
 using System.Reflection;
 using System.Net;
@@ -379,6 +380,8 @@ namespace CMZDedicatedLidgrenServer
                 _plugins.Register(new ServerAnnouncementsPlugin());
                 _plugins.Register(new ServerRememberTimePlugin());
                 _plugins.Register(new ServerVanillaSpawnerPlugin());
+
+                _plugins.LoadExternalPlugins(Path.Combine(_saveRoot, "Plugins"));
 
                 _plugins.InitializeAll(new ServerPluginContext
                 {
@@ -820,6 +823,8 @@ namespace CMZDedicatedLidgrenServer
             catch
             {
             }
+
+            _commands?.EnsureMemberRankAssigned(0UL, playerName);
 
             _plugins.NotifyPlayerJoined(new ServerPlayerEventContext
             {
@@ -1654,7 +1659,9 @@ namespace CMZDedicatedLidgrenServer
         }
 
         /// <summary>
-        /// Drops client-authored messages that only the authoritative dedicated server is allowed to send.
+        /// Drops client-authored messages that only the authoritative dedicated server is allowed
+        /// to send, plus payloads whose message id is not in the vanilla registry - an
+        /// unresolvable packet can never be validated and is a remote-crash vector for peers.
         /// </summary>
         private bool ShouldDropClientAuthorityPacket(byte senderId, byte recipientId, byte[] payload, string route)
         {
@@ -1669,11 +1676,14 @@ namespace CMZDedicatedLidgrenServer
             }
             catch
             {
-                return false;
+                typeName = null;
             }
 
             if (string.IsNullOrWhiteSpace(typeName))
-                return false;
+            {
+                _log($"[Security] Dropped unresolvable message id {payload[0]} from player {senderId}; route={route}.");
+                return true;
+            }
 
             if (!IsServerOnlyMessage(typeName))
                 return false;

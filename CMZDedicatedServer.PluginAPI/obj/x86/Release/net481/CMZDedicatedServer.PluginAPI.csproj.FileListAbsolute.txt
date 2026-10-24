@@ -1,0 +1,5 @@
+C:\Users\Admin\Documents\GitHub\CastleForge\Servers\CMZDedicatedServer.PluginAPI\bin\x86\Release\net481\ServerPluginAPI.dll
+C:\Users\Admin\Documents\GitHub\CastleForge\Servers\CMZDedicatedServer.PluginAPI\obj\x86\Release\net481\CMZDedicatedServer.PluginAPI.csproj.AssemblyReference.cache
+C:\Users\Admin\Documents\GitHub\CastleForge\Servers\CMZDedicatedServer.PluginAPI\obj\x86\Release\net481\CMZDedicatedServer.PluginAPI.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\Admin\Documents\GitHub\CastleForge\Servers\CMZDedicatedServer.PluginAPI\obj\x86\Release\net481\CMZDedicatedServer.PluginAPI.csproj.CoreCompileInputs.cache
+C:\Users\Admin\Documents\GitHub\CastleForge\Servers\CMZDedicatedServer.PluginAPI\obj\x86\Release\net481\ServerPluginAPI.dll

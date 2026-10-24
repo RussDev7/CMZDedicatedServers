@@ -7,6 +7,7 @@ This file is part of https://github.com/RussDev7/CMZDedicatedServers - see LICEN
 using System.Collections.Generic;
 using System.Linq;
 using System;
+using CMZDedicatedServer.Plugins;
 
 namespace CMZDedicatedSteamServer.Commands
 {
@@ -48,6 +49,7 @@ namespace CMZDedicatedSteamServer.Commands
         private readonly Func<string, bool> _unbanPlayer;
         private readonly Action _reloadAll;
         private readonly Action _reloadPlugins;
+        private readonly Action _restartServer;
         private readonly Func<string, ServerCommandTarget> _resolveTarget;
 
         public ServerCommandManager(
@@ -59,6 +61,7 @@ namespace CMZDedicatedSteamServer.Commands
             Func<string, bool> unbanPlayer,
             Action reloadAll,
             Action reloadPlugins,
+            Action restartServer,
             Func<string, ServerCommandTarget> resolveTarget)
         {
             _log = log ?? (_ => { });
@@ -68,6 +71,7 @@ namespace CMZDedicatedSteamServer.Commands
             _unbanPlayer = unbanPlayer;
             _reloadAll = reloadAll;
             _reloadPlugins = reloadPlugins;
+            _restartServer = restartServer;
             _resolveTarget = resolveTarget;
 
             _permissions = new ServerCommandPermissionStore(baseDir, _log);
@@ -77,7 +81,7 @@ namespace CMZDedicatedSteamServer.Commands
         }
 
         /// <summary>
-        /// True when <paramref name="rawText"/> starts with the current configured command prefix.
+        /// True when <paramref name="rawText"/> starts with one of the configured command prefixes.
         /// </summary>
         public bool IsCommand(string rawText)
         {
@@ -87,8 +91,15 @@ namespace CMZDedicatedSteamServer.Commands
             if (!_permissions.Enabled)
                 return false;
 
-            string prefix = string.IsNullOrEmpty(_permissions.Prefix) ? "!" : _permissions.Prefix;
-            return rawText.TrimStart().StartsWith(prefix, StringComparison.Ordinal);
+            string text = rawText.TrimStart();
+
+            foreach (string prefix in _permissions.Prefixes.OrderByDescending(prefix => prefix.Length))
+            {
+                if (text.StartsWith(prefix, StringComparison.Ordinal))
+                    return true;
+            }
+
+            return false;
         }
 
         /// <summary>
@@ -154,13 +165,22 @@ namespace CMZDedicatedSteamServer.Commands
             if (context == null || !_permissions.Enabled)
                 return false;
 
-
-            if (!ServerCommandParser.TryParse(context.RawText, _permissions.Prefix, out string commandName, out string[] args))
+            if (!ServerCommandParser.TryParse(
+                context.RawText,
+                _permissions.Prefixes,
+                out string usedPrefix,
+                out string commandName,
+                out string[] args))
+            {
                 return false;
+            }
+
+            if (string.IsNullOrEmpty(usedPrefix))
+                usedPrefix = _permissions.Prefix;
 
             if (!_commands.TryGetValue(commandName, out ServerCommandDefinition command))
             {
-                context.SendReply("[Server] Unknown command. Use " + _permissions.Prefix + "help.");
+                context.SendReply("[Server] Unknown command. Use " + usedPrefix + "help.");
 
                 context.WriteLog(
                     "[Commands] Unknown command from " +
@@ -181,7 +201,7 @@ namespace CMZDedicatedSteamServer.Commands
                     "[Server] You need " +
                     ServerCommandRankHelper.ToConfigString(requiredRank) +
                     " to use " +
-                    _permissions.Prefix +
+                    usedPrefix +
                     command.Name +
                     ".");
 
@@ -208,7 +228,7 @@ namespace CMZDedicatedSteamServer.Commands
             catch (Exception ex)
             {
                 context.SendReply("[Server] Command failed: " + ex.Message);
-                context.WriteLog("[Commands] Exception while executing " + _permissions.Prefix + command.Name + ": " + ex);
+                context.WriteLog("[Commands] Exception while executing " + usedPrefix + command.Name + ": " + ex);
             }
 
             return true;
@@ -226,11 +246,11 @@ namespace CMZDedicatedSteamServer.Commands
             string commandText = rawText.Trim();
             string prefix = string.IsNullOrEmpty(_permissions.Prefix) ? "!" : _permissions.Prefix;
 
-            // Console can type either:
+            // Console can type:
             // op Jacob
-            // or:
             // !op Jacob
-            if (!commandText.StartsWith(prefix, StringComparison.Ordinal))
+            // /op Jacob
+            if (!IsCommand(commandText))
                 commandText = prefix + commandText;
 
             return TryExecute(new ServerCommandContext
@@ -256,8 +276,15 @@ namespace CMZDedicatedSteamServer.Commands
                 "help",
                 "help [page]",
                 "Shows available commands.",
-                ServerCommandRank.Default,
+                ServerCommandRank.Visitor,
                 HandleHelp);
+
+            Register(
+                "rank",
+                "rank",
+                "Shows your command rank.",
+                ServerCommandRank.Visitor,
+                HandleRank);
 
             Register(
                 "players",
@@ -265,6 +292,13 @@ namespace CMZDedicatedSteamServer.Commands
                 "Lists connected players.",
                 ServerCommandRank.Moderator,
                 HandlePlayers);
+
+            Register(
+                "status",
+                "status",
+                "Shows server status and information.",
+                ServerCommandRank.Visitor,
+                HandleStatus);
 
             Register(
                 "kick",
@@ -289,10 +323,17 @@ namespace CMZDedicatedSteamServer.Commands
 
             Register(
                 "reload",
-                "reload [all|plugins|commands]",
-                "Reloads server config, plugins, or command files.",
+                "reload [plugins|commands|all]",
+                "Reloads full server runtime config (default), plugins, or command files.",
                 ServerCommandRank.Admin,
                 HandleReload);
+
+            Register(
+                "restart",
+                "restart",
+                "Restarts the dedicated server process.",
+                ServerCommandRank.Admin,
+                HandleRestart);
 
             Register(
                 "op",
@@ -310,7 +351,7 @@ namespace CMZDedicatedSteamServer.Commands
 
             Register(
                 "setrank",
-                "setrank <player|steamid|key> <Default|Member|Moderator|Admin>",
+                "setrank <player|steamid|key> <Visitor|Member|Moderator|Admin>",
                 "Sets a player's command rank.",
                 ServerCommandRank.Admin,
                 HandleSetRank);
@@ -368,6 +409,26 @@ namespace CMZDedicatedSteamServer.Commands
                 : "Player list is not available.";
 
             SendMultiline(context, text);
+        }
+
+        private void HandleRank(ServerCommandContext context, string[] args)
+        {
+            ServerCommandRank senderRank = _permissions.GetPlayerRank(context);
+            context.SendReply(
+                "[Server] " +
+                SafeName(context.PlayerName, context.PlayerId) +
+                " rank: " +
+                ServerCommandRankHelper.ToConfigString(senderRank));
+        }
+
+        private void HandleStatus(ServerCommandContext context, string[] args)
+        {
+            string playerList = _getPlayerListText != null
+                ? _getPlayerListText()
+                : "Player list is not available.";
+
+            context.SendReply("[Server] Server Status:");
+            context.SendReply("[Server] " + playerList);
         }
 
         private void HandleKick(ServerCommandContext context, string[] args)
@@ -496,7 +557,19 @@ namespace CMZDedicatedSteamServer.Commands
                 return;
             }
 
-            context.SendReply("[Server] Usage: " + _permissions.Prefix + "reload [all|plugins|commands]");
+            context.SendReply("[Server] Usage: " + _permissions.Prefix + "reload [plugins|commands|all]");
+        }
+
+        private void HandleRestart(ServerCommandContext context, string[] args)
+        {
+            if (_restartServer == null)
+            {
+                context.SendReply("[Server] Restart is not available.");
+                return;
+            }
+
+            context.SendReply("[Server] Restarting server...");
+            _restartServer();
         }
 
         private void HandleOp(ServerCommandContext context, string[] args)
@@ -543,7 +616,7 @@ namespace CMZDedicatedSteamServer.Commands
         {
             if (args == null || args.Length < 2)
             {
-                context.SendReply("[Server] Usage: " + _permissions.Prefix + "setrank <player|steamid|key> <Default|Member|Moderator|Admin>");
+                context.SendReply("[Server] Usage: " + _permissions.Prefix + "setrank <player|steamid|key> <Visitor|Member|Moderator|Admin>");
                 return;
             }
 
@@ -564,10 +637,7 @@ namespace CMZDedicatedSteamServer.Commands
                 return;
             }
 
-            if (rank == ServerCommandRank.Default)
-                _permissions.RemovePlayerRank(key);
-            else
-                _permissions.SetPlayerRank(key, rank);
+            _permissions.SetPlayerRank(key, rank);
 
             context.SendReply(
                 "[Server] Set " +
@@ -578,6 +648,38 @@ namespace CMZDedicatedSteamServer.Commands
         }
 
         #endregion
+
+        /// <summary>
+        /// Resolves a connected player's saved rank for the built-in trust layer.
+        /// Prefers the stable steam: identity key, then falls back to the name: key.
+        /// </summary>
+        public ServerCommandRank GetRankForPlayer(ulong remoteId, string playerName)
+        {
+            if (_permissions == null)
+                return ServerCommandRank.Member;
+
+            if (remoteId != 0UL &&
+                _permissions.TryGetRankForIdentityKey(
+                    "steam:" + remoteId,
+                    out ServerCommandRank steamRank))
+            {
+                return steamRank;
+            }
+
+            if (!string.IsNullOrWhiteSpace(playerName))
+                return _permissions.GetRankForIdentityKey("name:" + playerName.Trim());
+
+            return ServerCommandRank.Member;
+        }
+
+        /// <summary>
+        /// Ensures a connecting player has an explicit Member rank on record so every
+        /// player holds a rank instead of being unranked.
+        /// </summary>
+        public void EnsureMemberRankAssigned(ulong remoteId, string playerName)
+        {
+            _permissions?.EnsureMemberRankAssigned(remoteId, playerName);
+        }
 
         #region Helpers
 
@@ -749,6 +851,93 @@ namespace CMZDedicatedSteamServer.Commands
             }
 
             return text;
+        }
+
+        /// <summary>
+        /// Registers commands from a plugin that implements IServerCommandPlugin.
+        /// </summary>
+        public void RegisterPluginCommands(IServerCommandPlugin plugin)
+        {
+            if (plugin == null)
+                return;
+
+            try
+            {
+                List<PluginCommand> commands = plugin.GetCommands();
+                if (commands == null || commands.Count == 0)
+                    return;
+
+                foreach (var cmd in commands)
+                {
+                    if (string.IsNullOrWhiteSpace(cmd.Name) ||
+                        (cmd.Handler == null && cmd.ContextHandler == null))
+                        continue;
+
+                    string normalizedName = ServerCommandParser.NormalizeCommandName(cmd.Name);
+                    if (_commands.ContainsKey(normalizedName))
+                    {
+                        _log($"[Commands] Plugin command '{cmd.Name}' conflicts with existing command, skipping.");
+                        continue;
+                    }
+
+                    ServerCommandRank defaultRank = ServerCommandRank.Visitor;
+
+                    if (!string.IsNullOrWhiteSpace(cmd.RequiredRank))
+                    {
+                        if (ServerCommandRankHelper.TryParseStrict(cmd.RequiredRank, out ServerCommandRank parsedRank))
+                        {
+                            defaultRank = parsedRank;
+                        }
+                        else
+                        {
+                            _log($"[Commands] Plugin command '{cmd.Name}' has unknown RequiredRank '{cmd.RequiredRank}', using Admin.");
+                            defaultRank = ServerCommandRank.Admin;
+                        }
+                    }
+
+                    // Wrap the plugin command handler to match the server command signature
+                    Action<ServerCommandContext, string[]> wrappedHandler = (context, args) =>
+                    {
+                        try
+                        {
+                            if (cmd.ContextHandler != null)
+                            {
+                                cmd.ContextHandler(new PluginCommandContext
+                                {
+                                    PlayerId = context.PlayerId,
+                                    PlayerName = context.PlayerName,
+                                    RemoteId = context.RemoteId,
+                                    RemoteKey = context.RemoteKey,
+                                    SendReply = context.SendReply,
+                                    Broadcast = context.Broadcast,
+                                    Log = context.Log
+                                }, args);
+                            }
+                            else
+                            {
+                                cmd.Handler(args);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            _log($"[Commands] Plugin command '{cmd.Name}' threw exception: {ex.Message}");
+                        }
+                    };
+
+                    _commands[normalizedName] = new ServerCommandDefinition(
+                        cmd.Name,
+                        $"{cmd.Name} <args>",
+                        cmd.Description ?? "Plugin command",
+                        defaultRank,
+                        wrappedHandler);
+
+                    _log($"[Commands] Registered plugin command: !{cmd.Name}");
+                }
+            }
+            catch (Exception ex)
+            {
+                _log($"[Commands] Failed to register commands from plugin: {ex.Message}");
+            }
         }
         #endregion
     }

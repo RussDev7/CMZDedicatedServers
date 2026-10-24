@@ -27,6 +27,16 @@ Both hosts load the original game/runtime assemblies through reflection, start a
 - Hardens host authority by validating packet sender identity and blocking client-authored host-only messages such as forced host migration and spoofed kick packets.
 - Logs command usage to dated audit files under `Logs\commands-yyyy-MM-dd.log` when `log-command-audit=true`.
 - Includes a built-in VanillaSpawners plugin that can prevent new vanilla spawner blocks and random vanilla loot blocks from generating, while optionally blocking existing spawner activation.
+- Supports configurable command prefix aliases such as `!` and `/` for in-game server commands.
+- Supports escaped multiline Announcements plugin messages using `\n`.
+- Supports external server plugin DLLs under each host's `Plugins` folder, with optional per-plugin `Dependencies` folders.
+- Includes a shared `CMZDedicatedServer.PluginAPI` project for transport-neutral plugin contracts.
+- RegionProtect supports name-based allow-lists and SteamID64 allow-lists on the Steam dedicated server.
+- Treats every client packet as an untrusted request through the built-in server policy (`Trust\ServerPolicy.cs`), Minecraft-style: movement speed, stamina, flight, noclip/embed, teleport, reach, inventory/item provenance, held-item claims, block edits, crates, pickups, enemy spawning/control, combat claims, explosives, dragon control, and server-authority messages are all validated against server-owned state before anything is accepted or relayed. Violations strike per kind, kicks persist per SteamID, and repeat offenders escalate into timed auto-bans.
+- Sends the real protocol `KickMessage` (plus a private reason text) before transport deny so kicked players actually leave the world instead of lingering in a zombie session.
+- Automatically generates a fresh world when `world-guid` is configured but no `world.info` or backup exists.
+- Self-heals the hosted Steam lobby: a once-a-minute liveness probe detects when Steam has silently dropped the lobby and recreates it automatically, so a long-running server no longer vanishes from the in-game browser while still running.
+- Cleans up orphaned dragons server-side: when the current dragon controller disconnects, the removal is broadcast to every player exactly once instead of leaving a ghost dragon behind.
 
 ## Project layout
 
@@ -34,16 +44,31 @@ Both hosts load the original game/runtime assemblies through reflection, start a
 CMZDedicatedServers/
 ├─ LICENSE
 ├─ README.md
-├─ build.bat
-├─ clean.bat
+├─ GUI-TODO.md
+├─ BuildPlugin.ps1          # menu script: builds the server or Shared/Plugins projects
 ├─ Directory.Build.props
 ├─ Build/
-│  ├─ CMZDedicatedSteamServer/
+│  ├─ CMZDedicatedSteamServer/    # deployed exe, server.properties, Plugins/, Logs/, Worlds/
 │  └─ CMZDedicatedLidgrenServer/
 ├─ CMZDedicatedServers.sln
+├─ CMZDedicatedServer.PluginAPI/
+│  ├─ CMZDedicatedServer.PluginAPI.csproj
+│  └─ Plugins/
+│     └─ ServerPluginContracts.cs
+├─ Shared/                        # created on demand: shared plugin source projects
+│  └─ Plugins/
+│     └─ Example/
+│        ├─ Example.csproj
+│        └─ ServerExamplePlugin.cs
 ├─ CMZDedicatedLidgrenServer/
 │  ├─ CMZDedicatedLidgrenServer.csproj
 │  ├─ Program.cs
+│  ├─ Commands/                   # in-game command registry, ranks, permission store
+│  │  ├─ ServerCommandManager.cs
+│  │  ├─ ServerCommandContext.cs
+│  │  ├─ ServerCommandParser.cs
+│  │  ├─ ServerCommandPermissionStore.cs
+│  │  └─ ServerCommandRank.cs
 │  ├─ Config/
 │  │  └─ ServerConfig.cs
 │  ├─ Hosting/
@@ -54,6 +79,13 @@ CMZDedicatedServers/
 │  │  └─ CmzMessageCodec.cs
 │  ├─ Patching/
 │  │  └─ ServerPatches.cs
+│  ├─ Plugins/                    # built-in plugins compiled into the host
+│  │  ├─ ServerPluginManager.cs
+│  │  ├─ Announcements/
+│  │  ├─ FloodGuard/
+│  │  ├─ RegionProtect/
+│  │  ├─ RememberTime/
+│  │  └─ VanillaSpawners/
 │  ├─ Templates/
 │  │  └─ server.properties
 │  ├─ World/
@@ -69,25 +101,51 @@ CMZDedicatedServers/
 └─ CMZDedicatedSteamServer/
    ├─ CMZDedicatedSteamServer.csproj
    ├─ Program.cs
+   ├─ ServerGuiForm.cs
+   ├─ Commands/                   # in-game command registry, ranks, permission store
+   │  ├─ ServerCommandManager.cs
+   │  ├─ ServerCommandContext.cs
+   │  ├─ ServerCommandParser.cs
+   │  ├─ ServerCommandPermissionStore.cs
+   │  └─ ServerCommandRank.cs
    ├─ Common/
    │  └─ ReflectEx.cs
    ├─ Config/
    │  └─ SteamServerConfig.cs
    ├─ Hosting/
    │  ├─ ServerAssemblyLoader.cs
+   │  ├─ ServerBanStore.cs
    │  ├─ SteamConnectionApproval.cs
    │  ├─ SteamDedicatedServer.cs
    │  ├─ SteamLobbyHost.cs
    │  └─ SteamPeerRegistry.cs
    ├─ Networking/
    │  └─ CmzMessageCodec.cs
+   ├─ Patching/
+   │  └─ ServerPatches.cs
+   ├─ Plugins/                    # built-in plugins compiled into the host
+   │  ├─ ServerPluginManager.cs
+   │  ├─ Announcements/
+   │  ├─ FloodGuard/
+   │  ├─ RegionProtect/
+   │  ├─ RememberTime/
+   │  ├─ VanillaSpawners/
+   │  └─ DiscordPlugin/
    ├─ Steam/
    │  └─ SteamServerBootstrap.cs
    ├─ Templates/
    │  ├─ server.properties
    │  └─ steam_appid.txt
+   ├─ Trust/                      # core server-authority enforcement (not a plugin)
+   │  ├─ ServerPolicy.cs
+   │  ├─ ItemPolicy.cs
+   │  ├─ ShadowCombatTracker.cs
+   │  ├─ ShadowCombatTracker.Projectiles.cs
+   │  ├─ ShadowVoxelMotion.cs
+   │  └─ CombatSimulationNotes.md
    ├─ World/
-   │  └─ ServerWorldHandler.cs
+   │  ├─ ServerWorldHandler.cs
+   │  └─ TerrainProbe.cs
    ├─ Libs/
    │  └─ 0Harmony.dll
    └─ ServerHost/
@@ -150,6 +208,21 @@ Key files include:
 - `Steam/SteamServerBootstrap.cs`
 - `World/ServerWorldHandler.cs`
 - `Networking/CmzMessageCodec.cs`
+
+### `CMZDedicatedServer.PluginAPI`
+The shared plugin API project contains transport-neutral server plugin contracts and context types used by both dedicated hosts.
+
+It is intended for external and shared server plugins to reference without depending on Steam-only or Lidgren-only internals.
+
+### `Shared/Plugins`
+The shared plugin source tree can hold reusable plugin projects that target both hosts.
+
+A plugin under `Shared/Plugins/<PluginName>/` can build once and copy its output into both:
+
+```text
+Build\CMZDedicatedSteamServer\Plugins\<PluginName>\
+Build\CMZDedicatedLidgrenServer\Plugins\<PluginName>\
+```
 
 ### Shared responsibilities
 Across both hosts, the project still centers around the same core flow:
@@ -323,7 +396,15 @@ Expected build output:
 ```text
 Build/
 ├─ CMZDedicatedSteamServer/
+│  ├─ CastleForge.ServerPluginAPI.dll
+│  └─ Plugins/
+│     └─ Example/
+│        └─ Example.dll
 └─ CMZDedicatedLidgrenServer/
+   ├─ CastleForge.ServerPluginAPI.dll
+   └─ Plugins/
+      └─ Example/
+         └─ Example.dll
 ```
 
 ### Option 2: Build from Visual Studio / MSBuild
@@ -339,6 +420,8 @@ Project files:
 ```text
 src/CMZDedicatedSteamServer/CMZDedicatedSteamServer.csproj
 src/CMZDedicatedLidgrenServer/CMZDedicatedLidgrenServer.csproj
+src/CMZDedicatedServer.PluginAPI/CMZDedicatedServer.PluginAPI.csproj
+src/Shared/Plugins/Example/Example.csproj
 ```
 
 Important project settings:
@@ -347,6 +430,8 @@ Important project settings:
 - Shared build root: `Build\`
 - Steam host output path: `Build\CMZDedicatedSteamServer\`
 - Lidgren host output path: `Build\CMZDedicatedLidgrenServer\`
+- Shared plugin API project: `CMZDedicatedServer.PluginAPI`
+- Shared plugin source projects: `Shared\Plugins\<PluginName>\`
 
 ## Running
 
@@ -386,6 +471,18 @@ World loaded     : True
 
 Then connect using the server IP and the configured `server-port`.
 
+## Desktop GUI
+
+Launching `CMZDedicatedSteamServer.exe` with no arguments opens a desktop window that wraps the server:
+
+- **Header**: Start / Stop / Restart controls plus live status chips — status dot, connected players, uptime, **TPS** (real ticks/sec measured by the server loop), and memory usage. TPS colors: green ≥50, amber 30–50, red <30.
+- **Console tab**: streamed server output with category colors, live search (highlights every match as you type; Enter jumps to the next), pause-scroll toggle, a command bar with Up/Down history and a quick-commands dropdown.
+- **Players tab**: connected player cards with name, SteamID, session time, and Kick/Ban/copy actions (expand arrow or right-click).
+- **Settings tab**: a `server.properties` editor that mirrors the file's own sections and order — every key in the file gets a row, including ones the editor doesn't recognize (shown under their raw name). Boolean and enumerated fields get wheel-safe dropdowns (scrolling the page can't flip values); **Save to file** writes back preserving comments and ordering (with a `.bak` backup); a `FileSystemWatcher` auto-reloads the editor when the file changes on disk, and a filter box narrows rows live.
+- **Appearance**: accent color presets + custom picker and console text color, stored in `GuiSettings.ini` next to the exe.
+
+The GUI runs the server as a hidden `--console` child process; closing the window requires stopping the server first.
+
 ## Game binaries and support libraries
 
 ### Game folder
@@ -418,6 +515,24 @@ src\CMZDedicatedLidgrenServer\ServerHost\Libs\0Harmony.dll
 
 It does not need to live next to the executable.
 
+### Server plugin API
+External server plugins reference the shared plugin API assembly.
+
+For public/release builds, the intended friendly DLL name is:
+
+```text
+CastleForge.ServerPluginAPI.dll
+```
+
+This file should live beside each dedicated server executable:
+
+```text
+Build\CMZDedicatedSteamServer\CastleForge.ServerPluginAPI.dll
+Build\CMZDedicatedLidgrenServer\CastleForge.ServerPluginAPI.dll
+```
+
+Do not copy a separate copy of the API DLL into each plugin's `Dependencies` folder. Keeping one shared API assembly loaded by the server avoids plugin type identity problems.
+
 ## World and save data
 
 The host derives the world folder from `world-guid` and expects it under the selected host's world storage layout:
@@ -430,6 +545,8 @@ Typical files used by the host include:
 - `world.info`
 - chunk delta data
 - player inventory saves
+
+If `world-guid` is configured but neither `world.info` nor a backup exists, the host **generates a fresh world automatically** on first start — no manual world file editing or restart is needed. The generated world is then persisted like any other save.
 
 Both dedicated hosts keep the same general world/save flow even though the repository is now split into two server implementations.
 
@@ -454,6 +571,70 @@ Both dedicated hosts validate packet sender identity before relaying gameplay pa
 The hosts also block client-authored host-only packets, including forced host migration and spoofed kick-style packets. This keeps host authority on the dedicated server instead of allowing a modified peer to appoint itself as host or remove other players.
 
 This protection is built in and has no required configuration.
+
+## Steam lobby watchdog
+
+The Steam host's in-game browser listing lives in a Steam lobby owned by the host account. Steam destroys a user's owned lobbies whenever the client session drops — and it does so **silently**: metadata updates to the dead lobby keep "succeeding" locally, so a long-running dedicated server could disappear from the browser while logging healthy "Updated lobby metadata" lines.
+
+To prevent this, the Steam host probes its own lobby once a minute by asking Steam to re-read the lobby data. If the lobby is actually gone, the probe flips the native session state to *not in session*, which the watchdog uses as the signal to mark the lobby lost and create a fresh one a few seconds later — retrying until Steam cooperates, so the listing recovers on its own with no restart needed.
+
+The watchdog only recreates on positive proof the lobby is gone. A still-alive lobby answers the probe cleanly and is never touched, and when Steam itself is unreachable the probe simply yields no answer instead of risking a duplicate "ghost" lobby in the browser.
+
+## Server trust policy
+
+The Steam host includes a core server-authority layer in `Trust\ServerPolicy.cs` — not a plugin. Every client packet is treated as an untrusted request and validated against server-owned state before it is accepted or relayed. The design goal is the same model a Minecraft dedicated server uses: a client cannot simply *claim* something happened; the server decides whether it is allowed. A client can't change its own game mode, can't grant itself items, can't fly, and can't teleport unless the server's rules allow it.
+
+### What is checked
+
+| Area | Enforcement |
+|------|-------------|
+| Movement speed | Position updates are compared against the accepted baseline; sustained speed above ~20 m/s counts violations, above ~40 m/s kicks immediately. Falls are excluded — only upward vertical counts. |
+| Stamina | A server-side shadow pool tracks sprint drain and regen in real time. Sprinting on an empty pool strikes; in game modes where sprint is disabled (Endurance, DragonEndurance) any sprint-speed update drains it instantly. |
+| Flight / hover | Sustained airborne time without support counts fly violations; fast flight usually trips the speed cap first. |
+| Noclip / embed | Checked against the terrain probe plus the saved block-delta overlay. Only a fully buried player counts — feet solid, head solid, solid cells above the head, and solid lateral neighbors — so bumping into a wall never false-flags. |
+| Teleport | Distance beyond the snap threshold counts unless the game mode permits it; re-teleports inside the cooldown are rate violations. The baseline resyncs to the accepted position so legitimate lag teleports cannot cascade into false kicks. |
+| Reach | Block edits and pickup requests beyond ~7 m are rejected. Reach grows with position staleness so lag and frozen baselines don't produce false positives. Claimed digs of air are treated as desync, not cheats. |
+| Block edits | Placement/digging is checked against the authoritative overlay **before** the world state changes: forged/non-vanilla block types, undiggable blocks, and region-protected edits are rejected. |
+| Inventory / items | Server-owned baselines track provenance: what a player provably owns, credits earned (picked up, crafted), and ammo spent. Unearned items, forged stacks, and unexplained ammo gains are denied; craft chains are solved automatically so honest crafting passes. |
+| Phantom items | Once a save reconcile *proves* an item unearned, that id is flagged — dropping it, placing it, equipping it, firing it, or swinging it is an instant kick. |
+| Held-item claims | Gunshots, rockets, grenades, and melee claims must name the weapon the client last reported holding. Shooting rockets while holding a pistol is denied. |
+| Pickups / crates | Create/request/consume flow is resolved server-side with reach checks; forged drops are rejected while legitimate drops stay reclaimable. |
+| Enemy spawning / kills | Spawn and kill claims are checked against a live enemy registry plus a shadow-combat simulation. Fabricated claims — instant kills, impossible time-to-kill, repeated kill-aura sweeps, kills with a gun that never fired, and melee kill floods — are denied and strike. |
+| Canary enemies | The server plants its own unreachable decoy enemies and retires them itself. A kill claim naming a canary is provably fabricated — instant strike, no grace, and the trap stays armed. |
+| Explosives | Blast loot drops are correlated to real detonations near real loot blocks; forged drops are rejected. Lethal blast exposure arms the godmode check — surviving a provably lethal blast strikes. |
+| Dragons | The server runs dragon scheduling itself instead of trusting client spawn requests. Update/attack/migrate messages are only legal from the current controller; when the controller disconnects the server removes the orphaned dragon for everyone. |
+| Peer relay | Only genuinely peer-directed packets get relayed. Client-declared sender ids must match the real connection; relayed world mutations and spoofed senders are dropped. |
+| Server authority | Client-authored host-only messages — forced host migration, spoofed kicks, server-only types — are rejected outright. |
+| Ghost / invisibility | Clients must announce themselves before acting and keep streaming position and inventory normally. Suppressed announcements, actions while dead, spoofed positions, and silent clients all strike. |
+| Malformed packets | Declared payload lengths are bounded before allocation, so crafted oversized counts can't alloc-bomb the host. Parse failures and unregistered message ids are dropped, never relayed, and count as protocol violations. |
+| Chat / relay forgery | Messages forged in another player's name or carrying a fake `[Server]` prefix are denied and strike. |
+| Flood | FloodGuard blackholes senders above ~120 packets/sec for 3 seconds. |
+
+### Ranks — who is trusted and who is not
+
+**Nobody is trusted except Moderator and Admin.** Rank order: `Visitor < Member < Moderator < Admin`.
+
+- **Every player who joins is assigned Member** and persisted to `Commands\CommandRanks.ini` — every player always holds a member rank.
+- **Member** = normal player. Fully subject to every trust check above.
+- **Visitor** = restricted rank below Member, assigned by `!setrank` for guests/demoted players. Fully subject to trust checks, plus the optional `TrustVisitorEditBlock` restriction on world edits.
+- **Moderator and Admin** = operators. They bypass the core trust checks — the server treats them as staff, not as clients to police.
+
+There is no longer a `Default` rank. Legacy `Default`/`Defualt` values in old config files are migrated automatically: player-rank entries read as `Member` (ordinary player) and command-permission entries read as `Visitor` (usable by everyone).
+
+### Violations, kicks, and bans
+
+- Violations are counted **per kind in separate buckets** — a fly strike never adds to an item strike. Provable wire-fact kinds (reach, stamina, combat, teleport, canary, ghost, godmode, protocol, malformed) kick at **5 strikes**; timing- and desync-sensitive kinds (fly, speed, noclip, item) get more slack and kick at **10**.
+- Each bucket **decays independently after ~120 seconds idle** — a messy minute does not follow a player for the whole session.
+- Some offenses skip counting entirely: proven phantom-item use, identity forgery, and sustained extreme speed are **instant kicks**.
+- Once a kick is issued, `KickIssued` latches: later packets from that player are consumed silently with no extra violations or duplicate kick attempts.
+- The kick sequence sends a private `[Server] Kicked...` text, then the real protocol `KickMessage` so the client drops to the actual kicked/banned dialog, then transport `Deny` cleans up. Admin `!kick`/`!ban` use the same protocol message so every enforced drop is a real disconnect.
+- **Kick counts are SteamID-keyed and persisted to `Kicks.ini`** — they survive restarts and never auto-reset. Per-session violation state resets on rejoin; the kick count does not. Rejoining cannot launder it.
+- Kicks inside the escalation window convert to **auto-bans** persisted in `Bans.ini` on a growing ladder — **1, 3, 7, 14, then 30 days, permanent at the 6th ban**. Cheat longer, stay gone longer.
+- `SteamDedicatedServer.Update()` drains at most 512 packets per tick, so a packet flood cannot starve the pending-drop queue and delay a kick.
+
+### Honest limits
+
+Client-side rendering cheats — X-ray, ESP, wallhacks, fullbright, minimap reveal, aim-assist visuals — cannot be proven from server-side evidence alone and are out of scope for this layer.
 
 ## Player Enforcement
 
@@ -484,7 +665,19 @@ Steam bans are SteamID-backed and also save the last known player name for reada
 
 Lidgren bans are IP/name-backed and are useful for direct-IP hosting, but they are weaker than SteamID bans because names and IP addresses can change.
 
-Player Enforcement uses a hard drop / transport-level removal path instead of relying only on normal client-side kick messages. This helps prevent modified clients from bypassing enforcement by removing the kick-message pipeline.
+Player Enforcement sends the real protocol `KickMessage` so the client shows the kicked/banned dialog and leaves the session, followed by a transport-level deny for cleanup. Modified clients that ignore the kick message are still severed by the deny, and normal clients exit immediately instead of lingering in a zombie session.
+
+### Command ranks and in-game commands
+
+The hosts also provide in-game commands using configurable prefixes (`!` and `/` by default): `help`, `status`, `players`, `kick`, `ban`, `unban`, `reload`, `restart`, `op`, `deop`, `setrank`.
+
+Every connected player holds a rank stored in `Commands\CommandRanks.ini` (auto-assigned `Member` on first join); each command's required rank lives in `Commands\CommandPermissions.ini`:
+
+```text
+Visitor < Member < Moderator < Admin
+```
+
+`Visitor` is a restricted rank for demoted/guest players. `Moderator` and `Admin` are operator ranks — they also bypass the server policy described above. `op`/`deop`/`setrank` manage the rank file at runtime, e.g. `!setrank <player> Moderator`.
 
 ## Time / day progression
 
@@ -517,32 +710,134 @@ Notes:
 
 - The server is built around **reflection** rather than direct game project references.
 - The hosts use the original game message types and message registry where possible.
-- The server update loop is driven by `tick-rate-hz`.
+- The server update loop is driven by `tick-rate-hz`. The host raises the process timer resolution (`timeBeginPeriod(1)`) at startup — without it Windows caps sleeps at ~15.6 ms slices and the loop tops out near 32 ticks/s no matter what `tick-rate-hz` is set to.
 - Pickup, inventory, chunk, and terrain flow are now handled server-side well enough for basic dedicated play.
 - The repository now keeps **Steam** and **Lidgren** as separate projects under one solution.
 - The root build process outputs both hosts into the shared `Build` folder.
+- External plugin DLLs are loaded after the built-in plugins are registered, then all registered plugins are initialized together.
 
 ## Server Plugins
 
-CastleForge Dedicated Servers now include basic **server-side plugin support** for host-authoritative world protections and future server extensions.
+CastleForge Dedicated Servers include **server-side plugin support** for host-authoritative world protections, server automation, and future server extensions.
 
 Plugins run inside the dedicated server process and can inspect selected host/world packets before the server applies or relays them. This allows the server to enforce rules even when connecting players do **not** have the matching client-side mod installed.
+
+Both hosts support two plugin styles:
+
+- **Built-in plugins** compiled directly into the dedicated server build and registered by the host at startup.
+- **External plugin DLLs** loaded from each server's runtime `Plugins` folder.
 
 Current built-in plugin support includes:
 
 - **Announcements** private join messages and timed global messages
 - **FloodGuard** malicious packet spam protection
 - **RememberTime** per-world time persistence between restarts
-- **RegionProtect** server enforcement
-- Includes server-side **Player Enforcement** commands for listing players, hard-kicking, banning, unbanning, viewing saved bans, managing command ranks, and protecting operators from kick/ban commands
+- **RegionProtect** server-side region enforcement: block mining/placing protection, explosion protection, crate item protection, and crate break protection inside configured regions
+- **Player Enforcement** commands for listing players, hard-kicking, banning, unbanning, viewing saved bans, managing command ranks, and protecting operators from kick/ban commands
 - **VanillaSpawners** vanilla spawner and random loot block generation controls
-- block mining / placing protection
-- explosion protection
-- crate item protection
-- crate break protection
-- per-world plugin configuration
 
-> Server plugins are currently compiled into the dedicated server build. External plugin DLL loading may be added later.
+Plugins keep global settings in `Plugins\<PluginName>\<PluginName>.Config.ini` and store per-world data under `Plugins\<PluginName>\Worlds\{WorldGuid}\` (for example `RememberTime\Worlds\{guid}\Time.State.ini`), so switching `world-guid` gives each world its own plugin state.
+
+### Plugin API
+
+External plugins should reference the shared server plugin API project:
+
+```text
+CMZDedicatedServer.PluginAPI
+```
+
+The public runtime assembly is intended to be copied beside each dedicated server executable:
+
+```text
+Build\CMZDedicatedSteamServer\CastleForge.ServerPluginAPI.dll
+Build\CMZDedicatedLidgrenServer\CastleForge.ServerPluginAPI.dll
+```
+
+If your local project file still outputs `CMZDedicatedServer.PluginAPI.dll`, either rename the project `AssemblyName` to `CastleForge.ServerPluginAPI` or adjust the runtime/docs to use the technical DLL name consistently.
+
+The plugin API contains the transport-neutral contracts and context types used by both hosts, such as:
+
+- `IServerPlugin`
+- `IServerWorldPlugin`
+- `IServerInboundPacketPlugin`
+- `IServerPlayerEventPlugin`
+- `IServerTickPlugin`
+- `IServerShutdownPlugin`
+- `IServerCommandPlugin`
+- `PluginCommand`
+- `PluginCommandContext`
+- `ServerPluginContext`
+- `HostMessageContext`
+- `ServerInboundPacketContext`
+- `ServerPlayerEventContext`
+
+Shared plugins should depend on these server callbacks, not on Steam-only or Lidgren-only transport internals.
+
+#### Plugin commands
+
+Plugins implementing `IServerCommandPlugin` return `PluginCommand` entries that are registered as in-game/server-console commands on the Steam host:
+
+- `Name` / `Description` — command name without the prefix and the help text.
+- `Handler` — legacy `Action<string[]>` callback with just the argument tokens.
+- `ContextHandler` — optional `Action<PluginCommandContext, string[]>` that additionally receives the sender's id/name/keys plus `SendReply` (private response), `Broadcast`, and `Log` callbacks. When set it takes precedence over `Handler`.
+- `RequiredRank` — optional default rank name (`Visitor`, `Member`, `Moderator`, `Admin`). When omitted the command is usable by every rank (Visitor and up, matching the old "Default = anyone" behavior); an unrecognized value fails safe to `Admin`. Server owners can still override the required rank per command through the command-permissions file.
+
+### External plugin DLL layout
+
+External plugins are loaded from the host's runtime `Plugins` folder.
+
+Example:
+
+```text
+Build/
+├─ CMZDedicatedSteamServer/
+│  ├─ CMZDedicatedSteamServer.exe
+│  ├─ CastleForge.ServerPluginAPI.dll
+│  └─ Plugins/
+│     └─ Example/
+│        ├─ Example.dll
+│        └─ Dependencies/
+│           └─ SomeDependency.dll
+└─ CMZDedicatedLidgrenServer/
+   ├─ CMZDedicatedLidgrenServer.exe
+   ├─ CastleForge.ServerPluginAPI.dll
+   └─ Plugins/
+      └─ Example/
+         ├─ Example.dll
+         └─ Dependencies/
+            └─ SomeDependency.dll
+```
+
+Dependency DLLs are optional. If a plugin has no extra DLL dependencies, the `Dependencies` folder is not required.
+
+### Shared plugin source layout
+
+Reusable plugins that target both hosts can live under:
+
+```text
+Shared/
+└─ Plugins/
+   └─ Example/
+      ├─ Example.csproj
+      └─ ServerExamplePlugin.cs
+```
+
+Each shared plugin project can build once and copy its output into both dedicated server runtime folders:
+
+```text
+Build\CMZDedicatedSteamServer\Plugins\Example\Example.dll
+Build\CMZDedicatedLidgrenServer\Plugins\Example\Example.dll
+```
+
+### Reload behavior
+
+The server `reload` command can reload runtime-safe config and plugin state, but it should not be treated as a DLL hot-reload system.
+
+On .NET Framework, plugin assemblies loaded into the default AppDomain cannot be unloaded cleanly. Adding, removing, or replacing plugin DLLs requires a dedicated server restart.
+
+### Trust model
+
+External server plugins run in the same process as the dedicated server. Only install plugins from trusted sources, because a plugin can read files, write files, send network messages, or crash the server process.
 
 ## Announcements Server Plugin
 
@@ -552,6 +847,7 @@ Announcements can:
 
 - send a private welcome message to each joining player
 - send a timed global message to all connected players
+- split configured messages into multiple chat lines using escaped `\n`
 - wait a configurable amount of time before the first global message
 - require a minimum number of online players before global messages are sent
 - reload its config from disk using the server console `reload` command, if enabled by the host
@@ -584,11 +880,11 @@ Enabled = true
 
 [Join]
 PrivateJoinMessageEnabled = true
-PrivateJoinMessage = Welcome {player}! This is a CastleForge dedicated server. Join us: dsc.gg/cforge
+PrivateJoinMessage = Welcome {player}! This is a CastleForge dedicated server. Join us: dsc.gg/cforge\nUse '/help' or '!help' for available commands.
 
 [Global]
 TimedGlobalMessageEnabled = true
-GlobalMessage = Need help, updates, or mods? Join the CastleForge Discord: dsc.gg/cforge
+GlobalMessage = Need help, updates, or mods? Join the CastleForge Discord: dsc.gg/cforge\nCurrent players: {players}/{maxplayers}
 InitialGlobalDelaySeconds = 120
 GlobalMessageIntervalMinutes = 15
 MinimumPlayersForGlobalMessage = 1
@@ -606,6 +902,35 @@ Announcement messages support simple runtime tokens:
 | `{time}`       | Current local server time.       | `8:30 PM`    |
 | `{date}`       | Current local server date.       | `2026-04-26` |
 
+### Multiline messages
+
+Announcement messages can use escaped `\n` to split one config value into multiple chat lines.
+
+Example:
+
+```ini
+PrivateJoinMessage = Welcome {player}!\nUse '/help' or '!help' for available commands.
+GlobalMessage = Join the CastleForge Discord: dsc.gg/cforge\nPlayers online: {players}/{maxplayers}
+```
+
+The server sends each line as a separate chat message.
+
+Example private join output:
+
+```text
+Welcome RussDev7!
+Use '/help' or '!help' for available commands.
+```
+
+Example global output:
+
+```text
+Join the CastleForge Discord: dsc.gg/cforge
+Players online: 3/32
+```
+
+Physical multiline INI values are not required. Keep the message on one config line and use `\n` where a line break should appear.
+
 ### Behavior
 
 The private join message is sent only to the joining player.
@@ -613,6 +938,12 @@ The private join message is sent only to the joining player.
 The timed global message is broadcast to all connected players after `InitialGlobalDelaySeconds`, then repeats every `GlobalMessageIntervalMinutes`.
 
 Set `MinimumPlayersForGlobalMessage = 0` to allow global messages even when the server is empty, or set it to `1` or higher to only announce when players are online.
+
+Notes:
+
+* `\n` is decoded by the Announcements plugin and sent as separate chat lines.
+* Empty multiline entries are skipped.
+* Multiline support applies to both `PrivateJoinMessage` and `GlobalMessage`.
 
 ## RegionProtect Server Plugin
 
@@ -679,16 +1010,20 @@ LogDenied              = true
 
 Each world has its own `RegionProtect.Regions.ini` file:
 
+`AllowedPlayers` accepts player display names. On the Steam dedicated server, `AllowedSteamIds` also accepts SteamID64 values for stable identity-based allow-lists.
+
 ```ini
 [SpawnProtection]
-Enabled        = true
-Range          = 64
-AllowedPlayers = RussDev7
+Enabled         = true
+Range           = 64
+AllowedPlayers  = RussDev7
+AllowedSteamIds = 76561198XXXXXXXXX
 
 [Region:SpawnTown]
-Min            = -80,0,-80
-Max            = 80,120,80
-AllowedPlayers = RussDev7,SomeAdmin
+Min             = -80,0,-80
+Max             = 80,120,80
+AllowedPlayers  = RussDev7,SomeAdmin
+AllowedSteamIds = 76561198XXXXXXXXX,76561198XXXXXXXXX
 ```
 
 ### Player warning behavior
@@ -708,6 +1043,10 @@ In some cases, the client may briefly show a block as broken or changed. The ser
 * Commands such as `/regionpos` and `/regioncreate` are not currently part of the dedicated server plugin.
 * Regions are currently edited manually through the `.ini` files.
 * Explosion restoration can visually desync on the attacking client, but protected explosion damage is not saved to the server.
+* On the Steam dedicated server, prefer `AllowedSteamIds` for trusted players/admins because SteamID64 is stable across display-name changes.
+* On the Lidgren dedicated server, RegionProtect allow-lists are effectively name-based.
+* Existing `RegionProtect.Regions.ini` files are not automatically rewritten with new keys. Add `AllowedSteamIds =` manually or regenerate the file if you want the new example format.
+* `AllowedSteamIds` expects numeric SteamID64 values, not Steam profile names or vanity URLs.
 
 ## FloodGuard plugin
 
@@ -761,7 +1100,7 @@ CMZDedicatedSteamServer/
 └─ Plugins/
    └─ VanillaSpawners/
       └─ VanillaSpawners.Config.ini
-````
+```
 
 For the Lidgren dedicated server:
 
@@ -948,4 +1287,4 @@ See [LICENSE](LICENSE) for details.
 
 Developed and maintained by:
 - RussDev7
-- unknowghost0
+- unknowghost

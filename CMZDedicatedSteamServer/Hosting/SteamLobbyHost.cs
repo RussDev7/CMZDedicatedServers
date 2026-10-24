@@ -36,6 +36,63 @@ namespace CMZDedicatedSteamServer.Hosting
         public bool IsLobbyReady { get; private set; }
         public object HostSessionInfo { get; private set; }
 
+        private PropertyInfo _inSessionProperty;
+
+        /// <summary>
+        /// Reflects SteamWorks.InSession: false after the native layer leaves the
+        /// lobby (e.g., when a dead-lobby probe hits its owner-mismatch cleanup).
+        /// </summary>
+        public bool IsSteamSessionAlive
+        {
+            get
+            {
+                _inSessionProperty ??= ReflectEx.GetRequiredProperty(_steamWorks.GetType(), "InSession");
+                return (bool)_inSessionProperty.GetValue(_steamWorks, null);
+            }
+        }
+
+        /// <summary>
+        /// The Steam lobby id recorded on HostSessionInfo.AltSessionID, or null.
+        /// </summary>
+        public ulong? LobbySteamId
+        {
+            get
+            {
+                if (HostSessionInfo == null)
+                    return null;
+
+                return Convert.ToUInt64(ReflectEx.GetRequiredMemberValue(HostSessionInfo, "AltSessionID"));
+            }
+        }
+
+        /// <summary>
+        /// Asks Steam to re-read our lobby's data. If the lobby is gone server-side,
+        /// the native owner check in OnLobbyDataUpdate tears the session down and
+        /// IsSteamSessionAlive turns false — that is the liveness signal.
+        /// </summary>
+        public void ProbeLobbyLiveness()
+        {
+            ulong? lobbyId = LobbySteamId;
+            if (lobbyId == null || !IsSteamSessionAlive)
+                return;
+
+            // ClearOnGameUpdatedCallback empties _sessionsRefreshing — without it a
+            // prior probe dedupes this one before RequestLobbyData is ever sent.
+            ReflectEx.GetRequiredMethod(_steamWorks.GetType(), "ClearOnGameUpdatedCallback", 0)
+                .Invoke(_steamWorks, null);
+            ReflectEx.GetRequiredMethod(_steamWorks.GetType(), "GetUpdatedGameInfo", 1)
+                .Invoke(_steamWorks, [lobbyId.Value]);
+        }
+
+        /// <summary>
+        /// Marks the managed lobby state lost so the host recreates it.
+        /// </summary>
+        public void MarkLobbyLost()
+        {
+            HostSessionInfo = null;
+            IsLobbyReady = false;
+        }
+
         public void BeginCreateLobby(string displayName, string displayMessage)
         {
             Type createSessionInfoType = ReflectEx.GetRequiredType(_commonAssembly, "DNA.Net.MatchMaking.CreateSessionInfo");
@@ -117,7 +174,10 @@ namespace CMZDedicatedSteamServer.Hosting
         /// </summary>
         public void RefreshLobbyMetadata()
         {
-            if (HostSessionInfo == null)
+            // The InSession guard is required: after the native LeaveLobby path
+            // frees _lobbyId, UpdateHostLobbyData would dereference a null
+            // CSteamID and crash the process.
+            if (HostSessionInfo == null || !IsSteamSessionAlive)
                 return;
 
             MethodInfo updateLobby = ReflectEx.GetRequiredMethod(_steamWorks.GetType(), "UpdateHostLobbyData", 1);

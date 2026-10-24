@@ -25,11 +25,19 @@ namespace CMZDedicatedSteamServer.Hosting
     /// - name  : Gamertag fallback ban.
     ///
     /// File format:
-    /// type|value|lastName|reason|createdUtcTicks
+    /// type|value|lastName|reason|createdUtcTicks|expiresUtcTicks|strikes
+    /// expiresUtcTicks = DateTime.MaxValue means permanent; strikes counts
+    /// auto-bans so repeat offenders escalate to longer durations.
     /// </summary>
     internal sealed class ServerBanStore
     {
         #region Fields
+
+        /// <summary>
+        /// Auto-ban duration ladder in days. Strike N gets EscalationDays[N-1];
+        /// past the end of the ladder the ban is permanent.
+        /// </summary>
+        private static readonly int[] EscalationDays = [1, 3, 7, 14, 30];
 
         /// <summary>
         /// Synchronizes access to the in-memory ban list and disk save/load operations.
@@ -56,8 +64,7 @@ namespace CMZDedicatedSteamServer.Hosting
         #region Construction
 
         /// <summary>
-        /// Creates the ban store, ensures the PlayerEnforcement directory exists,
-        /// and loads any existing bans from disk.
+        /// Creates the ban store and loads any existing bans from disk.
         /// </summary>
         /// <param name="baseDir">
         /// Base server directory. If null, the current AppDomain base directory is used.
@@ -69,10 +76,29 @@ namespace CMZDedicatedSteamServer.Hosting
         {
             _log = log ?? (_ => { });
 
-            string dir = Path.Combine(baseDir ?? AppDomain.CurrentDomain.BaseDirectory, "PlayerEnforcement");
-            Directory.CreateDirectory(dir);
-
+            string dir = baseDir ?? AppDomain.CurrentDomain.BaseDirectory;
             _path = Path.Combine(dir, "Bans.ini");
+
+            // Bans used to live in a PlayerEnforcement subfolder; keep them when flattening.
+            string legacyPath = Path.Combine(dir, "PlayerEnforcement", "Bans.ini");
+            if (!File.Exists(_path) && File.Exists(legacyPath))
+            {
+                try
+                {
+                    File.Move(legacyPath, _path);
+                }
+                catch
+                {
+                    try
+                    {
+                        File.Copy(legacyPath, _path);
+                    }
+                    catch
+                    {
+                    }
+                }
+            }
+
             Load();
         }
         #endregion
@@ -102,9 +128,13 @@ namespace CMZDedicatedSteamServer.Hosting
 
             lock (_sync)
             {
+                DateTime now = DateTime.UtcNow;
+
                 foreach (ServerBanRecord ban in _records)
                 {
-                    if (ban == null)
+                    // Expired records stay on file (their strike count drives
+                    // the next auto-ban duration) but no longer block joins.
+                    if (ban == null || ban.ExpiresUtc <= now)
                         continue;
 
                     if (ban.Type == "steam" && steamKey.Length > 0 && ban.Value == steamKey)
@@ -144,12 +174,16 @@ namespace CMZDedicatedSteamServer.Hosting
         /// <param name="steamId">SteamID to ban.</param>
         /// <param name="lastName">Last known player name for display in the ban list.</param>
         /// <param name="reason">Optional ban reason.</param>
-        public void BanSteam(ulong steamId, string lastName, string reason)
+        /// <param name="escalate">
+        /// True for policy auto-bans: increments the strike count and applies the
+        /// escalating duration ladder. False for manual bans: permanent.
+        /// </param>
+        public void BanSteam(ulong steamId, string lastName, string reason, bool escalate = false)
         {
             if (steamId == 0UL)
                 return;
 
-            AddOrUpdate("steam", steamId.ToString(), lastName, reason);
+            AddOrUpdate("steam", steamId.ToString(), lastName, reason, escalate);
         }
 
         /// <summary>
@@ -168,7 +202,7 @@ namespace CMZDedicatedSteamServer.Hosting
             if (value.Length == 0)
                 return;
 
-            AddOrUpdate("ip", value, lastName, reason);
+            AddOrUpdate("ip", value, lastName, reason, escalate: false);
         }
 
         /// <summary>
@@ -187,7 +221,7 @@ namespace CMZDedicatedSteamServer.Hosting
             if (value.Length == 0)
                 return;
 
-            AddOrUpdate("name", value, name, reason);
+            AddOrUpdate("name", value, name, reason, escalate: false);
         }
         #endregion
 
@@ -306,7 +340,12 @@ namespace CMZDedicatedSteamServer.Hosting
         /// <param name="value">Ban key value, such as SteamID, IP, or player name.</param>
         /// <param name="lastName">Last known player name for display.</param>
         /// <param name="reason">Optional ban reason.</param>
-        private void AddOrUpdate(string type, string value, string lastName, string reason)
+        /// <param name="escalate">
+        /// Auto-ban path: bumps the strike count and sets the expiry from the
+        /// duration ladder (1/3/7/14/30 days, then permanent). Strike history
+        /// survives expiry because expired records are never deleted.
+        /// </param>
+        private void AddOrUpdate(string type, string value, string lastName, string reason, bool escalate)
         {
             type = Normalize(type).ToLowerInvariant();
             value = Normalize(value);
@@ -327,6 +366,20 @@ namespace CMZDedicatedSteamServer.Hosting
                     }
                 }
 
+                int strikes = existing?.Strikes ?? 0;
+                DateTime expiresUtc = DateTime.MaxValue;
+
+                if (escalate)
+                {
+                    strikes++;
+                    int days = strikes <= EscalationDays.Length ? EscalationDays[strikes - 1] : 0;
+                    if (days > 0)
+                        expiresUtc = DateTime.UtcNow.AddDays(days);
+
+                    reason = $"{reason} (auto-ban #{strikes}, {(days > 0 ? days + "d" : "permanent")})";
+                    _log($"[PlayerEnforcement] Auto-ban #{strikes} for {lastName} ({value}): {(days > 0 ? days + " days" : "permanent")}.");
+                }
+
                 if (existing == null)
                 {
                     _records.Add(new ServerBanRecord
@@ -335,13 +388,17 @@ namespace CMZDedicatedSteamServer.Hosting
                         Value = value,
                         LastName = Clean(lastName),
                         Reason = Clean(reason),
-                        CreatedUtc = DateTime.UtcNow
+                        CreatedUtc = DateTime.UtcNow,
+                        ExpiresUtc = expiresUtc,
+                        Strikes = strikes
                     });
                 }
                 else
                 {
                     existing.LastName = Clean(lastName);
                     existing.Reason = Clean(reason);
+                    existing.ExpiresUtc = expiresUtc;
+                    existing.Strikes = strikes;
                 }
             }
 
@@ -385,13 +442,26 @@ namespace CMZDedicatedSteamServer.Hosting
                             ? new DateTime(ticks, DateTimeKind.Utc)
                             : DateTime.UtcNow;
 
+                    // Older 5-field lines load as permanent bans with no strikes.
+                    DateTime expiresUtc =
+                        parts.Length >= 6 && long.TryParse(parts[5], out long expTicks)
+                            ? new DateTime(expTicks, DateTimeKind.Utc)
+                            : DateTime.MaxValue;
+
+                    int strikes =
+                        parts.Length >= 7 && int.TryParse(parts[6], out int s) && s > 0
+                            ? s
+                            : 0;
+
                     _records.Add(new ServerBanRecord
                     {
                         Type = Normalize(parts[0]).ToLowerInvariant(),
                         Value = Normalize(parts[1]),
                         LastName = parts.Length >= 3 ? Clean(parts[2]) : string.Empty,
                         Reason = parts.Length >= 4 ? Clean(parts[3]) : string.Empty,
-                        CreatedUtc = createdUtc
+                        CreatedUtc = createdUtc,
+                        ExpiresUtc = expiresUtc,
+                        Strikes = strikes
                     });
                 }
             }
@@ -413,7 +483,7 @@ namespace CMZDedicatedSteamServer.Hosting
 
             using StreamWriter sw = new(_path, false);
             sw.WriteLine("# CastleForge Dedicated Server bans");
-            sw.WriteLine("# type|value|lastName|reason|createdUtcTicks");
+            sw.WriteLine("# type|value|lastName|reason|createdUtcTicks|expiresUtcTicks|strikes");
 
             foreach (ServerBanRecord ban in snapshot)
             {
@@ -422,7 +492,9 @@ namespace CMZDedicatedSteamServer.Hosting
                     Clean(ban.Value) + "|" +
                     Clean(ban.LastName) + "|" +
                     Clean(ban.Reason) + "|" +
-                    ban.CreatedUtc.Ticks);
+                    ban.CreatedUtc.Ticks + "|" +
+                    ban.ExpiresUtc.Ticks + "|" +
+                    ban.Strikes);
             }
         }
         #endregion
@@ -495,6 +567,19 @@ namespace CMZDedicatedSteamServer.Hosting
         /// UTC time when the ban record was originally created.
         /// </summary>
         public DateTime CreatedUtc;
+
+        /// <summary>
+        /// UTC time the ban expires. DateTime.MaxValue = permanent.
+        /// Expired records are kept (they hold the auto-ban strike count)
+        /// but IsBanned ignores them.
+        /// </summary>
+        public DateTime ExpiresUtc = DateTime.MaxValue;
+
+        /// <summary>
+        /// Number of auto-bans issued for this identity — drives the
+        /// escalating duration ladder. Manual bans leave it untouched.
+        /// </summary>
+        public int Strikes;
     }
     #endregion
 }

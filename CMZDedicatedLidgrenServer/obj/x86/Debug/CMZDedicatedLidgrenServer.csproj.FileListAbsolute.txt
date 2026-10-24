@@ -1,0 +1,12 @@
+C:\Users\Admin\Documents\GitHub\CastleForge\Servers\Build\CMZDedicatedLidgrenServer\Libs\0Harmony.dll
+C:\Users\Admin\Documents\GitHub\CastleForge\Servers\Build\CMZDedicatedLidgrenServer\RunServer.bat
+C:\Users\Admin\Documents\GitHub\CastleForge\Servers\Build\CMZDedicatedLidgrenServer\Game\README.txt
+C:\Users\Admin\Documents\GitHub\CastleForge\Servers\Build\CMZDedicatedLidgrenServer\Inventory\default.inv
+C:\Users\Admin\Documents\GitHub\CastleForge\Servers\Build\CMZDedicatedLidgrenServer\Worlds\b8c81243-b6ac-48fe-a782-1e2dc5a44d17\world.info
+C:\Users\Admin\Documents\GitHub\CastleForge\Servers\Build\CMZDedicatedLidgrenServer\server.properties
+C:\Users\Admin\Documents\GitHub\CastleForge\Servers\Build\CMZDedicatedLidgrenServer\CMZDedicatedLidgrenServer.exe
+C:\Users\Admin\Documents\GitHub\CastleForge\Servers\CMZDedicatedLidgrenServer\obj\x86\Debug\CMZDedicatedLidgrenServer.csproj.AssemblyReference.cache
+C:\Users\Admin\Documents\GitHub\CastleForge\Servers\CMZDedicatedLidgrenServer\obj\x86\Debug\CMZDedicatedLidgrenServer.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\Admin\Documents\GitHub\CastleForge\Servers\CMZDedicatedLidgrenServer\obj\x86\Debug\CMZDedicatedLidgrenServer.csproj.CoreCompileInputs.cache
+C:\Users\Admin\Documents\GitHub\CastleForge\Servers\CMZDedicatedLidgrenServer\obj\x86\Debug\CMZDedic.48C82FCB.Up2Date
+C:\Users\Admin\Documents\GitHub\CastleForge\Servers\CMZDedicatedLidgrenServer\obj\x86\Debug\CMZDedicatedLidgrenServer.exe

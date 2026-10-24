@@ -77,7 +77,7 @@ namespace CMZDedicatedLidgrenServer.Commands
         }
 
         /// <summary>
-        /// True when <paramref name="rawText"/> starts with the current configured command prefix.
+        /// True when <paramref name="rawText"/> starts with one of the configured command prefixes.
         /// </summary>
         public bool IsCommand(string rawText)
         {
@@ -87,8 +87,15 @@ namespace CMZDedicatedLidgrenServer.Commands
             if (!_permissions.Enabled)
                 return false;
 
-            string prefix = string.IsNullOrEmpty(_permissions.Prefix) ? "!" : _permissions.Prefix;
-            return rawText.TrimStart().StartsWith(prefix, StringComparison.Ordinal);
+            string text = rawText.TrimStart();
+
+            foreach (string prefix in _permissions.Prefixes.OrderByDescending(prefix => prefix.Length))
+            {
+                if (text.StartsWith(prefix, StringComparison.Ordinal))
+                    return true;
+            }
+
+            return false;
         }
 
         /// <summary>
@@ -154,12 +161,22 @@ namespace CMZDedicatedLidgrenServer.Commands
             if (context == null || !_permissions.Enabled)
                 return false;
 
-            if (!ServerCommandParser.TryParse(context.RawText, _permissions.Prefix, out string commandName, out string[] args))
+            if (!ServerCommandParser.TryParse(
+                context.RawText,
+                _permissions.Prefixes,
+                out string usedPrefix,
+                out string commandName,
+                out string[] args))
+            {
                 return false;
+            }
+
+            if (string.IsNullOrEmpty(usedPrefix))
+                usedPrefix = _permissions.Prefix;
 
             if (!_commands.TryGetValue(commandName, out ServerCommandDefinition command))
             {
-                context.SendReply("[Server] Unknown command. Use " + _permissions.Prefix + "help.");
+                context.SendReply("[Server] Unknown command. Use " + usedPrefix + "help.");
 
                 context.WriteLog(
                     "[Commands] Unknown command from " +
@@ -180,7 +197,7 @@ namespace CMZDedicatedLidgrenServer.Commands
                     "[Server] You need " +
                     ServerCommandRankHelper.ToConfigString(requiredRank) +
                     " to use " +
-                    _permissions.Prefix +
+                    usedPrefix +
                     command.Name +
                     ".");
 
@@ -207,7 +224,7 @@ namespace CMZDedicatedLidgrenServer.Commands
             catch (Exception ex)
             {
                 context.SendReply("[Server] Command failed: " + ex.Message);
-                context.WriteLog("[Commands] Exception while executing " + _permissions.Prefix + command.Name + ": " + ex);
+                context.WriteLog("[Commands] Exception while executing " + usedPrefix + command.Name + ": " + ex);
             }
 
             return true;
@@ -225,11 +242,11 @@ namespace CMZDedicatedLidgrenServer.Commands
             string commandText = rawText.Trim();
             string prefix = string.IsNullOrEmpty(_permissions.Prefix) ? "!" : _permissions.Prefix;
 
-            // Console can type either:
+            // Console can type:
             // op Jacob
-            // or:
             // !op Jacob
-            if (!commandText.StartsWith(prefix, StringComparison.Ordinal))
+            // /op Jacob
+            if (!IsCommand(commandText))
                 commandText = prefix + commandText;
 
             return TryExecute(new ServerCommandContext
@@ -255,7 +272,7 @@ namespace CMZDedicatedLidgrenServer.Commands
                 "help",
                 "help [page]",
                 "Shows available commands.",
-                ServerCommandRank.Default,
+                ServerCommandRank.Visitor,
                 HandleHelp);
 
             Register(
@@ -309,7 +326,7 @@ namespace CMZDedicatedLidgrenServer.Commands
 
             Register(
                 "setrank",
-                "setrank <player|steamid|key> <Default|Member|Moderator|Admin>",
+                "setrank <player|steamid|key> <Visitor|Member|Moderator|Admin>",
                 "Sets a player's command rank.",
                 ServerCommandRank.Admin,
                 HandleSetRank);
@@ -542,7 +559,7 @@ namespace CMZDedicatedLidgrenServer.Commands
         {
             if (args == null || args.Length < 2)
             {
-                context.SendReply("[Server] Usage: " + _permissions.Prefix + "setrank <player|steamid|key> <Default|Member|Moderator|Admin>");
+                context.SendReply("[Server] Usage: " + _permissions.Prefix + "setrank <player|steamid|key> <Visitor|Member|Moderator|Admin>");
                 return;
             }
 
@@ -563,10 +580,7 @@ namespace CMZDedicatedLidgrenServer.Commands
                 return;
             }
 
-            if (rank == ServerCommandRank.Default)
-                _permissions.RemovePlayerRank(key);
-            else
-                _permissions.SetPlayerRank(key, rank);
+            _permissions.SetPlayerRank(key, rank);
 
             context.SendReply(
                 "[Server] Set " +
@@ -577,6 +591,15 @@ namespace CMZDedicatedLidgrenServer.Commands
         }
 
         #endregion
+
+        /// <summary>
+        /// Ensures a connecting player has an explicit Member rank on record so every
+        /// player holds a rank instead of being unranked.
+        /// </summary>
+        public void EnsureMemberRankAssigned(ulong remoteId, string playerName)
+        {
+            _permissions?.EnsureMemberRankAssigned(remoteId, playerName);
+        }
 
         #region Helpers
 

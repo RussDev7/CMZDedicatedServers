@@ -4,6 +4,7 @@ Copyright (c) 2025 RussDev7, unknowghost0
 This file is part of https://github.com/RussDev7/CMZDedicatedServers - see LICENSE for details.
 */
 
+using CMZDedicatedServer.Plugins;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -148,7 +149,16 @@ namespace CMZDedicatedSteamServer.Plugins.RememberTime
                 !_restoredThisProcess &&
                 _setTimeOfDay != null)
             {
-                if (TryLoadSavedTime(out float savedTimeOfDay))
+                if (!WorldDataExists(serverDir, worldKey))
+                {
+                    // The world folder is gone (deleted or never generated) -
+                    // a leftover time file belongs to the deleted world, so
+                    // drop it instead of resurrecting that world's day onto
+                    // the fresh world about to be generated.
+                    DeleteStaleState();
+                    _log("[RememberTime] World data not found; ignoring saved time for a fresh world.");
+                }
+                else if (TryLoadSavedTime(out float savedTimeOfDay))
                 {
                     _setTimeOfDay(savedTimeOfDay);
                     _log($"[RememberTime] Restored server time to {savedTimeOfDay:0.000000} ({FormatDisplayDay(savedTimeOfDay)}).");
@@ -363,6 +373,42 @@ Reason = {reason}
             {
                 _log($"[RememberTime] Failed to load saved time: {ex.Message}");
                 return false;
+            }
+        }
+
+        /// <summary>
+        /// True when the real world folder exists and holds any data at all
+        /// (world.info, delta .dat files, .inv saves). The plugin state lives
+        /// outside the world folder, so a deleted world used to leave a ghost
+        /// time file behind that resurrected the deleted world's day.
+        /// </summary>
+        private static bool WorldDataExists(string serverDir, string worldKey)
+        {
+            try
+            {
+                string worldDir = Path.Combine(serverDir, "Worlds", worldKey);
+                return Directory.Exists(worldDir) &&
+                       Directory.GetFileSystemEntries(worldDir).Length > 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Removes a state file that outlived its world.
+        /// </summary>
+        private void DeleteStaleState()
+        {
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(_statePath) && File.Exists(_statePath))
+                    File.Delete(_statePath);
+            }
+            catch (Exception ex)
+            {
+                _log($"[RememberTime] Failed to delete stale time state: {ex.Message}");
             }
         }
 

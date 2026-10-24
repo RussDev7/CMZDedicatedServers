@@ -7,9 +7,12 @@ This file is part of https://github.com/RussDev7/CMZDedicatedServers - see LICEN
 using CMZDedicatedSteamServer.Config;
 using CMZDedicatedSteamServer.Hosting;
 using System;
+using System.Collections.Concurrent;
+using System.Linq;
 using System.IO;
 using System.Reflection;
 using System.Threading;
+using System.Windows.Forms;
 
 namespace CMZDedicatedSteamServer
 {
@@ -22,6 +25,8 @@ namespace CMZDedicatedSteamServer
     /// </remarks>
     internal static class Program
     {
+        private const string GuiInstanceMutexName = "Local\\CMZDedicatedSteamServer.GuiSingleton";
+
         #region Command Audit Logging State
 
         /// <summary>
@@ -63,9 +68,53 @@ namespace CMZDedicatedSteamServer
         /// - This host also does NOT support username/password Steam login from config.
         ///   Steam's normal client API path requires an already-running Steam client.
         /// </remarks>
-        private static int Main()
+        [STAThread]
+        private static int Main(string[] args)
         {
-            Console.Title = "CMZ Dedicated Steam Server";
+            bool runConsole = args != null && args.Any(a => string.Equals(a, "--console", StringComparison.OrdinalIgnoreCase));
+            if (runConsole)
+                return RunConsoleHost();
+
+            bool createdNew;
+            using var guiMutex = new Mutex(true, GuiInstanceMutexName, out createdNew);
+            if (!createdNew)
+            {
+                MessageBox.Show(
+                    "CMZ Dedicated Steam Server is already running.",
+                    "Already running",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information
+                );
+                return 0;
+            }
+
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            Application.Run(new ServerGuiForm());
+            return 0;
+        }
+
+        [System.Runtime.InteropServices.DllImport("winmm.dll")]
+        private static extern uint timeBeginPeriod(uint uPeriod);
+
+        [System.Runtime.InteropServices.DllImport("winmm.dll")]
+        private static extern uint timeEndPeriod(uint uPeriod);
+
+        private static int RunConsoleHost()
+        {
+            // Windows sleeps in ~15.6 ms slices by default, so Thread.Sleep(16)
+            // becomes ~31 ms and the loop caps near 32 ticks/s regardless of
+            // tick-rate-hz. 1 ms resolution makes the configured rate real.
+            timeBeginPeriod(1);
+
+            try
+            {
+                Console.Title = "CMZ Dedicated Steam Server";
+            }
+            catch
+            {
+                // No attached console handle (e.g., launched by GUI with redirected streams).
+            }
 
             try
             {
@@ -74,6 +123,15 @@ namespace CMZDedicatedSteamServer
                 string baseDir = AppDomain.CurrentDomain.BaseDirectory;
                 Log($"Config file       : {Path.Combine(baseDir, "server.properties")}");
                 SteamServerConfig config = SteamServerConfig.Load(baseDir);
+
+                // Ensure Plugins/Dependencies folder exists
+                string pluginsDir = Path.Combine(baseDir, "Plugins");
+                string dependenciesDir = Path.Combine(pluginsDir, "Dependencies");
+                if (!Directory.Exists(dependenciesDir))
+                {
+                    Directory.CreateDirectory(dependenciesDir);
+                    Log($"Created Dependencies folder: {dependenciesDir}");
+                }
 
                 CommandAuditBaseDir = baseDir;
                 CommandAuditLogEnabled = config.LogCommandAudit;
@@ -97,18 +155,61 @@ namespace CMZDedicatedSteamServer
                     // 1) Support libraries beside the server, inside /Libs.
                     string libsDllPath = Path.Combine(libsPath, asmName.Name + ".dll");
                     if (File.Exists(libsDllPath))
-                        return Assembly.LoadFrom(libsDllPath);
+                    {
+                        try
+                        {
+                            return Assembly.LoadFrom(libsDllPath);
+                        }
+                        catch (Exception ex)
+                        {
+                            Log($"[AssemblyResolve] Failed to load {asmName.Name} from Libs: {ex.Message}");
+                        }
+                    }
 
-                    // 2) Game folder DLLs.
+                    // 2) Plugin dependencies folder (only if it exists).
+                    string pluginsDir = Path.Combine(baseDir, "Plugins");
+                    string pluginsDepPath = Path.Combine(pluginsDir, "Dependencies", asmName.Name + ".dll");
+                    if (Directory.Exists(Path.Combine(pluginsDir, "Dependencies")) && File.Exists(pluginsDepPath))
+                    {
+                        try
+                        {
+                            return Assembly.LoadFrom(pluginsDepPath);
+                        }
+                        catch (Exception ex)
+                        {
+                            Log($"[AssemblyResolve] Failed to load {asmName.Name} from Dependencies: {ex.Message}");
+                        }
+                    }
+
+                    // 3) Game folder DLLs.
                     string gameDllPath = Path.Combine(gamePath, asmName.Name + ".dll");
                     if (File.Exists(gameDllPath))
-                        return Assembly.LoadFrom(gameDllPath);
+                    {
+                        try
+                        {
+                            return Assembly.LoadFrom(gameDllPath);
+                        }
+                        catch (Exception ex)
+                        {
+                            Log($"[AssemblyResolve] Failed to load {asmName.Name} from Game: {ex.Message}");
+                        }
+                    }
 
-                    // 3) Game folder EXE assemblies.
+                    // 4) Game folder EXE assemblies.
                     string gameExeAsmPath = Path.Combine(gamePath, asmName.Name + ".exe");
                     if (File.Exists(gameExeAsmPath))
-                        return Assembly.LoadFrom(gameExeAsmPath);
+                    {
+                        try
+                        {
+                            return Assembly.LoadFrom(gameExeAsmPath);
+                        }
+                        catch (Exception ex)
+                        {
+                            Log($"[AssemblyResolve] Failed to load {asmName.Name} from Game (EXE): {ex.Message}");
+                        }
+                    }
 
+                    Log($"[AssemblyResolve] Could not resolve assembly: {asmName.Name}");
                     return null;
                 };
                 #endregion
@@ -119,40 +220,70 @@ namespace CMZDedicatedSteamServer
 
                 #endregion
 
-                using var server = new SteamDedicatedServer(baseDir, config, Log);
-
-                Console.CancelKeyPress += (_, e) =>
+                while (true)
                 {
-                    e.Cancel = true;
-                    Log("Ctrl+C received. Shutting down...");
-                    server.Stop();
-                };
+                    using var server = new SteamDedicatedServer(baseDir, config, Log);
 
-                server.Start();
-
-                StartConsoleCommandThread(server, Log);
-
-                int sleepMs = Math.Max(1, 1000 / Math.Max(1, config.TickRateHz));
-
-                while (server.IsRunning)
-                {
-                    try
+                    Console.CancelKeyPress += (_, e) =>
                     {
-                        server.Update();
-                    }
-                    catch (Exception ex)
+                        e.Cancel = true;
+                        Log("Ctrl+C received. Shutting down...");
+                        server.Stop();
+                    };
+
+                    server.Start();
+
+                    StartConsoleCommandThread(server, Log);
+
+                    int sleepMs = Math.Max(1, 1000 / Math.Max(1, config.TickRateHz));
+                    bool emitTelemetry = Console.IsOutputRedirected;
+                    int tpsTicks = 0;
+                    int tpsWindowMs = 1000;
+                    var tpsWatch = System.Diagnostics.Stopwatch.StartNew();
+
+                    while (server.IsRunning)
                     {
-                        Log("[MainLoop] " + ex);
+                        try
+                        {
+                            server.Update();
+                            tpsTicks++;
+                        }
+                        catch (Exception ex)
+                        {
+                            Log("[MainLoop] " + ex);
+                        }
+
+                        if (emitTelemetry)
+                        {
+                            long elapsed = tpsWatch.ElapsedMilliseconds;
+                            if (elapsed >= tpsWindowMs)
+                            {
+                                Console.Out.WriteLine("@@TPS " + (tpsTicks * 1000.0 / elapsed).ToString("0.0"));
+                                tpsTicks = 0;
+                                tpsWatch.Restart();
+                                tpsWindowMs = 2000;
+                            }
+                        }
+
+                        Thread.Sleep(sleepMs);
                     }
 
-                    Thread.Sleep(sleepMs);
+                    if (!server.RestartRequested)
+                    {
+                        timeEndPeriod(1);
+                        return 0;
+                    }
+
+                    Log("[Server] Restarting dedicated host...");
+                    Thread.Sleep(750);
+                    config = SteamServerConfig.Load(baseDir);
+                    CommandAuditLogEnabled = config.LogCommandAudit;
                 }
-
-                return 0;
             }
             catch (Exception ex)
             {
                 Log("FATAL: " + ex);
+                timeEndPeriod(1);
                 return 1;
             }
         }
@@ -259,10 +390,11 @@ namespace CMZDedicatedSteamServer
                 case "help":
                 case "?":
                     log("Console commands:");
-                    log("  reload                           Reload server.properties, plugin files, and command files");
+                    log("  reload                           Reload server.properties, plugins, and command files");
                     log("  reload properties                Reload runtime-safe server.properties values");
                     log("  reload plugins                   Reload plugin config/region/announcement files");
                     log("  reload commands                  Reload command permissions and player ranks");
+                    log("  restart                          Restart the server process");
                     log("  stop                             Stop the server");
                     log("  players                          List connected players");
                     log("  bans                             List saved bans");
@@ -296,6 +428,11 @@ namespace CMZDedicatedSteamServer
                 case "quit":
                     log("Console stop command received. Shutting down...");
                     server.Stop();
+                    break;
+
+                case "restart":
+                    log("Console restart command received. Restarting...");
+                    server.RequestRestart();
                     break;
 
                 default:
@@ -370,18 +507,120 @@ namespace CMZDedicatedSteamServer
         #region Logging
 
         /// <summary>
-        /// Writes a timestamped server message to the console and mirrors command audit lines to a dated file.
+        /// Writes a timestamped server message to the console and mirrors audit/operational lines to dated files.
         /// </summary>
         /// <param name="message">Message to write.</param>
-        private static void Log(string message)
+        // Fixed machine-tag -> human-label rewrites applied at the output
+        // boundary. Exact message-start prefixes only: type names inside the
+        // body, identifiers, paths and single-word tags are never rewritten.
+        private static readonly (string From, string To)[] LogLabelMap =
         {
-            string safeMessage = message ?? string.Empty;
-            string stampedLine = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {safeMessage}";
+            ("[PlayerEnforcement]", "[Player Enforcement]"),
+            ("[CombatEvidence]", "[Combat Evidence]"),
+            ("[ShadowCombat]", "[Shadow Combat]"),
+            ("[HostMsg]", "[Host Message]"),
+            ("[ConnectionApproval]", "[Connection Approval]"),
+            ("[AssemblyResolve]", "[Assembly Resolve]"),
+            ("[MainLoop]", "[Main Loop]"),
+            ("[StatusChanged]", "[Status Changed]"),
+            ("[SteamLobby]", "[Steam Lobby]"),
+        };
 
-            Console.WriteLine(stampedLine);
+        private static string FormatLogMessage(string message)
+        {
+            if (string.IsNullOrEmpty(message))
+                return message;
+            foreach ((string from, string to) in LogLabelMap)
+            {
+                if (message.StartsWith(from, StringComparison.Ordinal))
+                    return to + message.Substring(from.Length);
+            }
+            // Delimited so a player named e.g. ItemPolicyX is not rewritten.
+            if (message.StartsWith("[Trust] ItemPolicy:", StringComparison.Ordinal) ||
+                message.StartsWith("[Trust] ItemPolicy ", StringComparison.Ordinal))
+                return "[Trust] Item Policy" + message.Substring("[Trust] ItemPolicy".Length);
+            if (message.StartsWith("ServerWorld:", StringComparison.Ordinal) ||
+                message.StartsWith("ServerWorld ", StringComparison.Ordinal))
+                return "Server World" + message.Substring("ServerWorld".Length);
+            return message;
+        }
+
+        // Log output is produced on the game loop thread but written on a
+        // dedicated background writer: a slow or saturated console handle
+        // (redirected output, a tailing UI, disk stalls) must never block
+        // packet processing. Bounded queue — when writers fall behind, lines
+        // drop and the loss is reported instead of stalling the server.
+        private const int LogQueueCapacity = 8192;
+        private static readonly BlockingCollection<(string Stamped, string Safe)> LogQueue =
+            new BlockingCollection<(string, string)>(new ConcurrentQueue<(string, string)>(), LogQueueCapacity);
+        private static int _logDroppedCount;
+        private static Thread _logWriterThread;
+        private static readonly object LogWriterSync = new object();
+
+        private static void EnsureLogWriter()
+        {
+            if (_logWriterThread != null)
+                return;
+            lock (LogWriterSync)
+            {
+                if (_logWriterThread != null)
+                    return;
+                _logWriterThread = new Thread(LogWriterLoop)
+                {
+                    IsBackground = true,
+                    Name = "LogWriter"
+                };
+                _logWriterThread.Start();
+            }
+        }
+
+        private static void LogWriterLoop()
+        {
+            foreach ((string stampedLine, string safeMessage) in LogQueue.GetConsumingEnumerable())
+            {
+                WriteLogLine(stampedLine, safeMessage);
+
+                // Report dropped lines once per drain point, not per line.
+                int dropped = Interlocked.Exchange(ref _logDroppedCount, 0);
+                if (dropped > 0)
+                {
+                    string marker = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] [Log] {dropped} log line(s) dropped — writer saturated.";
+                    try { Console.WriteLine(marker); } catch { }
+                    if (CommandAuditLogEnabled)
+                        AppendServerLogLine(marker);
+                }
+            }
+        }
+
+        private static void WriteLogLine(string stampedLine, string safeMessage)
+        {
+            try
+            {
+                Console.WriteLine(stampedLine);
+            }
+            catch
+            {
+                // A dead console handle must never kill the writer thread.
+            }
 
             if (CommandAuditLogEnabled && IsCommandAuditLine(safeMessage))
                 AppendCommandAuditLogLine(stampedLine);
+
+            if (CommandAuditLogEnabled && IsSecurityAuditLine(safeMessage))
+                AppendSecurityAuditLogLine(stampedLine);
+
+            if (CommandAuditLogEnabled && IsServerLogLine(safeMessage))
+                AppendServerLogLine(stampedLine);
+        }
+
+        private static void Log(string message)
+        {
+            string safeMessage = FormatLogMessage(message ?? string.Empty);
+            string stampedLine = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {safeMessage}";
+
+            EnsureLogWriter();
+            if (!LogQueue.TryAdd((stampedLine, safeMessage)))
+                Interlocked.Increment(ref _logDroppedCount);
         }
 
         /// <summary>
@@ -391,6 +630,86 @@ namespace CMZDedicatedSteamServer
         {
             return !string.IsNullOrWhiteSpace(message) &&
                    message.StartsWith("[Commands]", StringComparison.Ordinal);
+        }
+
+        /// <summary>
+        /// Returns true when a console line belongs in the security audit log:
+        /// trust violations, forged/dropped packets, and kick/ban outcomes.
+        /// </summary>
+        private static bool IsSecurityAuditLine(string message)
+        {
+            // Accept both the raw machine tag and the humanized display form
+            // (callers may route messages before or after FormatLogMessage).
+            return !string.IsNullOrWhiteSpace(message) &&
+                   (message.StartsWith("[Trust]", StringComparison.Ordinal) ||
+                    message.StartsWith("[Security]", StringComparison.Ordinal) ||
+                    message.StartsWith("[PlayerEnforcement]", StringComparison.Ordinal) ||
+                    message.StartsWith("[Player Enforcement]", StringComparison.Ordinal));
+        }
+
+        /// <summary>
+        /// Returns true when a console line belongs in the general server log:
+        /// operational ServerWorld lines (world load/save, inventory serves)
+        /// and the log-combat-gated diagnostic lines ([CombatEvidence],
+        /// [ShadowCombat]) - emission is already gated by the config switch;
+        /// this only routes them to disk when they are emitted.
+        /// </summary>
+        private static bool IsServerLogLine(string message)
+        {
+            // Legacy machine tags and their spaced display forms both route.
+            return !string.IsNullOrWhiteSpace(message) &&
+                   (message.StartsWith("ServerWorld", StringComparison.Ordinal) ||
+                    message.StartsWith("Server World", StringComparison.Ordinal) ||
+                    message.StartsWith("[CombatEvidence]", StringComparison.Ordinal) ||
+                    message.StartsWith("[Combat Evidence]", StringComparison.Ordinal) ||
+                    message.StartsWith("[ShadowCombat]", StringComparison.Ordinal) ||
+                    message.StartsWith("[Shadow Combat]", StringComparison.Ordinal));
+        }
+
+        /// <summary>
+        /// Appends one operational line to Logs\server-yyyy-MM-dd.log.
+        /// </summary>
+        private static void AppendServerLogLine(string line)
+        {
+            try
+            {
+                string logsDir = Path.Combine(CommandAuditBaseDir, "Logs");
+                Directory.CreateDirectory(logsDir);
+
+                string path = Path.Combine(logsDir, "server-" + DateTime.Now.ToString("yyyy-MM-dd") + ".log");
+
+                lock (CommandAuditLogSync)
+                {
+                    File.AppendAllText(path, line + Environment.NewLine);
+                }
+            }
+            catch
+            {
+                // Never let logging failures break the dedicated server loop.
+            }
+        }
+
+        /// <summary>
+        /// Appends one security line to Logs\security-yyyy-MM-dd.log.
+        /// </summary>
+        private static void AppendSecurityAuditLogLine(string line)
+        {
+            try
+            {
+                string logsDir = Path.Combine(CommandAuditBaseDir, "Logs");
+                Directory.CreateDirectory(logsDir);
+
+                string path = Path.Combine(logsDir, "security-" + DateTime.Now.ToString("yyyy-MM-dd") + ".log");
+
+                lock (CommandAuditLogSync)
+                {
+                    File.AppendAllText(path, line + Environment.NewLine);
+                }
+            }
+            catch
+            {
+                // Never let logging failures break the dedicated server loop.
+            }
         }
 
         /// <summary>

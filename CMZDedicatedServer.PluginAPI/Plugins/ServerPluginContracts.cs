@@ -1,0 +1,532 @@
+﻿/*
+SPDX-License-Identifier: GPL-3.0-or-later
+Copyright (c) 2025 RussDev7, unknowghost0
+This file is part of https://github.com/RussDev7/CMZDedicatedServers - see LICENSE for details.
+*/
+
+using System;
+using System.Collections.Generic;
+
+namespace CMZDedicatedServer.Plugins
+{
+    #region Plugin Contracts
+
+    /// <summary>
+    /// Base interface for all dedicated server plugins.
+    /// </summary>
+    public interface IServerPlugin
+    {
+        /// <summary>
+        /// Display name used by the plugin manager for logging.
+        /// </summary>
+        string Name { get; }
+
+        /// <summary>
+        /// Initializes the plugin with server-provided paths, world identity, and logging services.
+        /// </summary>
+        void Initialize(ServerPluginContext context);
+    }
+
+    /// <summary>
+    /// Optional server-side world plugin that can inspect and optionally consume host/world messages.
+    /// </summary>
+    public interface IServerWorldPlugin : IServerPlugin
+    {
+        /// <summary>
+        /// Inspects a host/world message before normal server handling.
+        /// </summary>
+        bool BeforeHostMessage(HostMessageContext context);
+    }
+    #endregion
+
+    #region Optional Plugin Events
+
+    /// <summary>
+    /// Optional plugin interface for player join/leave notifications.
+    /// </summary>
+    public interface IServerPlayerEventPlugin
+    {
+        /// <summary>
+        /// Called after a player has joined and the server can send messages to them.
+        /// </summary>
+        void OnPlayerJoined(ServerPlayerEventContext context);
+
+        /// <summary>
+        /// Called after a player has disconnected.
+        /// </summary>
+        void OnPlayerLeft(ServerPlayerEventContext context);
+    }
+
+    /// <summary>
+    /// Optional plugin interface for periodic server updates.
+    /// </summary>
+    public interface IServerTickPlugin
+    {
+        /// <summary>
+        /// Called once per server update loop.
+        /// </summary>
+        void Update(ServerPluginTickContext context);
+    }
+
+    /// <summary>
+    /// Optional plugin interface for inspecting every inbound gameplay packet before host handling or relay.
+    /// </summary>
+    /// <remarks>
+    /// This hook runs above the world-message layer, so it can protect both host-directed packets
+    /// and peer-relay packets. Returning true consumes/drops the packet.
+    /// </remarks>
+    public interface IServerInboundPacketPlugin
+    {
+        /// <summary>
+        /// Inspects an inbound packet before the server handles or relays it.
+        /// </summary>
+        /// <param name="context">Packet context supplied by the transport host.</param>
+        /// <returns>True to consume/drop the packet; otherwise false.</returns>
+        bool BeforeInboundPacket(ServerInboundPacketContext context);
+    }
+
+    /// <summary>
+    /// Optional plugin interface for final save/cleanup when the server is stopping.
+    /// </summary>
+    public interface IServerShutdownPlugin
+    {
+        /// <summary>
+        /// Called when the server is stopping so file-backed plugins can flush final state.
+        /// </summary>
+        void OnServerStopping(ServerPluginShutdownContext context);
+    }
+    #endregion
+
+    #region Player / Tick Contexts
+
+    /// <summary>
+    /// Context supplied to plugins when a player joins or leaves.
+    /// </summary>
+    public sealed class ServerPlayerEventContext
+    {
+        public byte PlayerId { get; set; }
+
+        public string PlayerName { get; set; }
+
+        public int ConnectedPlayers { get; set; }
+
+        public int MaxPlayers { get; set; }
+
+        public Action<string> SendPrivateMessage { get; set; }
+
+        public Action<string> BroadcastMessage { get; set; }
+
+        public Action<string> Log { get; set; }
+    }
+
+    /// <summary>
+    /// Context supplied to plugins during the server update loop.
+    /// </summary>
+    public sealed class ServerPluginTickContext
+    {
+        public DateTime UtcNow { get; set; }
+
+        public int ConnectedPlayers { get; set; }
+
+        public int MaxPlayers { get; set; }
+
+        public Action<string> BroadcastMessage { get; set; }
+
+        public Action<string> Log { get; set; }
+
+        /// <summary>
+        /// Current authoritative server day/time value.
+        /// The integer part controls day progression; the fractional part controls visual time-of-day.
+        /// </summary>
+        public float TimeOfDay { get; set; }
+    }
+
+    /// <summary>
+    /// Context supplied to plugins when the server is stopping.
+    /// </summary>
+    public sealed class ServerPluginShutdownContext
+    {
+        public DateTime UtcNow { get; set; }
+
+        public float TimeOfDay { get; set; }
+
+        public Action<string> Log { get; set; }
+    }
+
+    /// <summary>
+    /// Context supplied to packet-level guard plugins before normal packet handling or relay.
+    /// </summary>
+    public sealed class ServerInboundPacketContext
+    {
+        /// <summary>
+        /// Server-side sender/player id. GID 0 is the host.
+        /// </summary>
+        public byte SenderId { get; set; }
+
+        /// <summary>
+        /// Best known display name for the sending player.
+        /// </summary>
+        public string SenderName { get; set; }
+
+        /// <summary>
+        /// Optional transport-level remote id. Steam uses the SteamID; Lidgren leaves this as 0.
+        /// </summary>
+        public ulong RemoteId { get; set; }
+
+        /// <summary>
+        /// Target player id from the outer channel-0 packet, or 0 for host/broadcast style packets.
+        /// </summary>
+        public byte RecipientId { get; set; }
+
+        /// <summary>
+        /// CastleMiner Z packet channel. Channel 0 is normal gameplay; channel 1 is wrapper/public traffic.
+        /// </summary>
+        public int Channel { get; set; }
+
+        /// <summary>
+        /// Channel-1 wrapper opcode when applicable. 0 means no wrapper opcode.
+        /// </summary>
+        public int WrappedOpcode { get; set; }
+
+        /// <summary>
+        /// Inner CastleMiner Z gameplay payload, including message id and checksum.
+        /// </summary>
+        public byte[] Payload { get; set; }
+
+        /// <summary>
+        /// Length of <see cref="Payload"/> in bytes.
+        /// </summary>
+        public int PayloadLength { get; set; }
+
+        /// <summary>
+        /// Current UTC time supplied by the host.
+        /// </summary>
+        public DateTime UtcNow { get; set; }
+
+        /// <summary>
+        /// Server log callback.
+        /// </summary>
+        public Action<string> Log { get; set; }
+
+        /// <summary>
+        /// Returns a short packet label for logs.
+        /// </summary>
+        public string DescribePacket()
+        {
+            return $"ch={Channel}, op={WrappedOpcode}, recipient={RecipientId}, bytes={PayloadLength}";
+        }
+    }
+    #endregion
+
+    #region Plugin Initialization Context
+
+    /// <summary>
+    /// Provides server-level initialization data to plugins.
+    /// </summary>
+    /// <remarks>
+    /// This context is passed once during plugin startup. It should contain stable information
+    /// such as the server executable directory and the active world key used for per-world config files.
+    /// </remarks>
+    public sealed class ServerPluginContext
+    {
+        /// <summary>
+        /// Base server directory used as the root for plugin config/storage folders.
+        /// </summary>
+        public string BaseDir { get; set; }
+
+        /// <summary>
+        /// Stable world identifier used by plugins for per-world config folders.
+        /// </summary>
+        /// <remarks>
+        /// Even though this is currently named WorldGuid, callers may pass a cleaned world folder key.
+        /// </remarks>
+        public string WorldGuid { get; set; }
+
+        /// <summary>
+        /// Server log callback.
+        /// </summary>
+        public Action<string> Log { get; set; }
+
+        /// <summary>
+        /// Reads the server's current authoritative day/time value.
+        /// The integer part controls the visible day number; the fractional part controls visual time-of-day.
+        /// </summary>
+        public Func<float> GetTimeOfDay { get; set; }
+
+        /// <summary>
+        /// Sets the server's authoritative day/time value.
+        /// Used by plugins that restore persisted world time on startup.
+        /// </summary>
+        public Action<float> SetTimeOfDay { get; set; }
+
+        /// <summary>
+        /// Kicks a player from the server by name.
+        /// Returns true if the player was found and kicked.
+        /// </summary>
+        public Func<string, string, bool> KickPlayer { get; set; }
+
+        /// <summary>
+        /// Bans a player from the server by name.
+        /// Returns true if the player was found and banned.
+        /// </summary>
+        public Func<string, string, bool> BanPlayer { get; set; }
+
+        /// <summary>
+        /// Unbans a player from the server by name.
+        /// Returns true if the player was found and unbanned.
+        /// </summary>
+        public Func<string, bool> UnbanPlayer { get; set; }
+
+        /// <summary>
+        /// Executes a server command.
+        /// Returns true if the command was executed successfully.
+        /// </summary>
+        public Func<string, bool> ExecuteServerCommand { get; set; }
+
+        /// <summary>
+        /// Broadcasts a chat message to all connected players.
+        /// </summary>
+        public Action<string> BroadcastMessage { get; set; }
+    }
+    #endregion
+
+    #region Delegates
+
+    /// <summary>
+    /// Attempts to read integer X/Y/Z components from a reflected IntVector3-like object.
+    /// </summary>
+    /// <param name="value">Reflected vector object.</param>
+    /// <param name="x">Output X coordinate.</param>
+    /// <param name="y">Output Y coordinate.</param>
+    /// <param name="z">Output Z coordinate.</param>
+    /// <returns>True when the vector was read successfully; otherwise false.</returns>
+    public delegate bool TryReadIntVector3Delegate(object value, out int x, out int y, out int z);
+
+    /// <summary>
+    /// Attempts to read the server's currently saved block type at a world block position.
+    /// </summary>
+    /// <remarks>
+    /// This usually reads from saved chunk delta data. It may return false for natural/procedural
+    /// terrain that has not been written into a chunk delta yet.
+    /// </remarks>
+    public delegate bool TryGetSavedBlockTypeDelegate(
+        int x,
+        int y,
+        int z,
+        out int blockTypeValue);
+
+    /// <summary>
+    /// Attempts to read the best known original block type for a denied terrain edit.
+    /// </summary>
+    /// <remarks>
+    /// This can use saved delta data or a recent DigMessage cache to restore denied mining visuals.
+    /// </remarks>
+    public delegate bool TryGetOriginalBlockTypeDelegate(
+        byte senderId,
+        int x,
+        int y,
+        int z,
+        out int blockTypeValue);
+
+    #endregion
+
+    #region Host Message Context
+
+    /// <summary>
+    /// Provides plugins with information and safe server callbacks for a host/world message.
+    /// </summary>
+    /// <remarks>
+    /// This object is created by the server world handler for each plugin-intercepted message.
+    /// Plugins should use the provided callbacks instead of directly touching server publics.
+    /// </remarks>
+    public sealed class HostMessageContext
+    {
+        #region Message Identity
+
+        /// <summary>
+        /// Full reflected network message type name.
+        /// </summary>
+        public string TypeName { get; set; }
+
+        /// <summary>
+        /// Server-side sender/player id.
+        /// </summary>
+        public byte SenderId { get; set; }
+
+        /// <summary>
+        /// Best known display name for the sending player.
+        /// </summary>
+        public string SenderName { get; set; }
+
+        /// <summary>
+        /// Optional transport-level remote identity.
+        /// Steam uses the sender SteamID64; Lidgren leaves this as 0.
+        /// </summary>
+        public ulong RemoteId { get; set; }
+
+        /// <summary>
+        /// Raw packet payload, including message id and checksum.
+        /// </summary>
+        public byte[] Payload { get; set; }
+
+        #endregion
+
+        #region Reflection Helpers
+
+        /// <summary>
+        /// Deserializes a raw packet into the original reflected CastleMiner Z message object.
+        /// </summary>
+        public Func<string, byte[], object> DeserializeGameMessage { get; set; }
+
+        /// <summary>
+        /// Reads a reflected field or property value from an object by name.
+        /// </summary>
+        public Func<object, string, object> GetMemberValue { get; set; }
+
+        /// <summary>
+        /// Reads integer X/Y/Z coordinates from a reflected IntVector3-like object.
+        /// </summary>
+        public TryReadIntVector3Delegate TryReadIntVector3 { get; set; }
+
+        #endregion
+
+        #region Correction / Resync Callbacks
+
+        /// <summary>
+        /// Requests that the server send the authoritative chunk back to the offending client.
+        /// </summary>
+        public Action<int, int, int> ResyncChunkForBlock { get; set; }
+
+        /// <summary>
+        /// Sends a private warning to the denied player.
+        /// </summary>
+        public Action<string> SendWarningToPlayer { get; set; }
+
+        /// <summary>
+        /// Sends a single corrective AlterBlockMessage to the denied player.
+        /// </summary>
+        public Action<int, int, int, int> SendAlterBlockToPlayer { get; set; }
+
+        #endregion
+
+        #region Block Lookup Callbacks
+
+        /// <summary>
+        /// Reads the current saved block type from the server-side world delta data.
+        /// </summary>
+        public TryGetSavedBlockTypeDelegate TryGetSavedBlockType { get; set; }
+
+        /// <summary>
+        /// Attempts to read the original block type that should be restored for a denied edit.
+        /// This can use saved delta data or a recent DigMessage cache.
+        /// </summary>
+        public TryGetOriginalBlockTypeDelegate TryGetOriginalBlockType { get; set; }
+
+        #endregion
+
+        #region Logging
+
+        /// <summary>
+        /// Server log callback.
+        /// </summary>
+        public Action<string> Log { get; set; }
+
+        #endregion
+    }
+    #endregion
+
+    #region IServerCommandPlugin
+
+    /// <summary>
+    /// Plugin interface for registering custom server commands.
+    /// Plugins implementing this interface can add their own commands to the server's command system.
+    /// </summary>
+    public interface IServerCommandPlugin
+    {
+        /// <summary>
+        /// Returns a list of commands this plugin wants to register with the server.
+        /// </summary>
+        /// <returns>List of command definitions</returns>
+        List<PluginCommand> GetCommands();
+    }
+
+    /// <summary>
+    /// Context supplied to plugin commands registered with <see cref="PluginCommand.ContextHandler"/>.
+    /// Mirrors the transport-neutral parts of the server's internal command context.
+    /// </summary>
+    public sealed class PluginCommandContext
+    {
+        /// <summary>
+        /// CastleMiner Z gamer id for the command sender. 0 for console executions.
+        /// </summary>
+        public byte PlayerId { get; set; }
+
+        /// <summary>
+        /// Best known display/gamertag for the command sender. "Console" for console executions.
+        /// </summary>
+        public string PlayerName { get; set; }
+
+        /// <summary>
+        /// Stable transport id when available. Steam uses SteamID; Lidgren may leave this as 0.
+        /// </summary>
+        public ulong RemoteId { get; set; }
+
+        /// <summary>
+        /// Persistent permission key for the sender, such as steam:7656119..., name:Player, or ip:127.0.0.1.
+        /// </summary>
+        public string RemoteKey { get; set; }
+
+        /// <summary>
+        /// Sends a private server message back to only the command sender.
+        /// </summary>
+        public Action<string> SendReply { get; set; }
+
+        /// <summary>
+        /// Sends a server message to every connected player.
+        /// </summary>
+        public Action<string> Broadcast { get; set; }
+
+        /// <summary>
+        /// Writes a message to the dedicated server console/log.
+        /// </summary>
+        public Action<string> Log { get; set; }
+    }
+
+    /// <summary>
+    /// Defines a command that a plugin wants to register with the server.
+    /// </summary>
+    public sealed class PluginCommand
+    {
+        /// <summary>
+        /// The command name (without the ! prefix, e.g., "anticheat" for !anticheat)
+        /// </summary>
+        public string Name;
+
+        /// <summary>
+        /// Description of what the command does (for help)
+        /// </summary>
+        public string Description;
+
+        /// <summary>
+        /// Callback to handle the command execution.
+        /// Receives only the argument tokens; use <see cref="ContextHandler"/> when the sender
+        /// or private replies are needed.
+        /// </summary>
+        public Action<string[]> Handler;
+
+        /// <summary>
+        /// Optional context-aware callback. When set, the server invokes this instead of
+        /// <see cref="Handler"/> so the plugin can reply privately to the sender.
+        /// </summary>
+        public Action<PluginCommandContext, string[]> ContextHandler;
+
+        /// <summary>
+        /// Optional default required rank name for this command, such as "Visitor",
+        /// "Member", "Moderator", or "Admin". When omitted the command is usable by
+        /// every rank (Visitor and up). Server owners can still override the value
+        /// through the command-permissions file.
+        /// </summary>
+        public string RequiredRank;
+    }
+    #endregion
+}

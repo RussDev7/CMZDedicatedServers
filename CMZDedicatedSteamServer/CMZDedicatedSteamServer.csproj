@@ -1,6 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
+    <OutputType>WinExe</OutputType>
     <TargetFramework>net481</TargetFramework>
     <PlatformTarget>x86</PlatformTarget>
     <AssemblyName>CMZDedicatedSteamServer</AssemblyName>
@@ -14,6 +14,7 @@
     <DebugType>none</DebugType>
     <GenerateSupportedRuntime>false</GenerateSupportedRuntime>
     <Nullable>disable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
     <Platforms>AnyCPU;x86</Platforms>
   </PropertyGroup>
 
@@ -52,14 +53,17 @@
   </ItemGroup>
 
   <ItemGroup>
-    <None Update="Templates\server.properties">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <TargetPath>server.properties</TargetPath>
-    </None>
+    <EmbeddedResource Include="Templates\server.properties">
+      <LogicalName>CMZDedicatedSteamServer.DefaultServerProperties</LogicalName>
+    </EmbeddedResource>
 
     <None Update="Templates\steam_appid.txt">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <TargetPath>steam_appid.txt</TargetPath>
     </None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CMZDedicatedServer.PluginAPI\CMZDedicatedServer.PluginAPI.csproj" />
   </ItemGroup>
 </Project>

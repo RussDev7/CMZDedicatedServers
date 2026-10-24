@@ -4,13 +4,16 @@ Copyright (c) 2025 RussDev7, unknowghost0
 This file is part of https://github.com/RussDev7/CMZDedicatedServers - see LICENSE for details.
 */
 
+using CMZDedicatedServer.Plugins;
 using CMZDedicatedSteamServer.Plugins;
-using System.Runtime.CompilerServices;
-using System.Collections.Generic;
-using System.Reflection;
-using System.Text;
-using System.IO;
+using CMZDedicatedSteamServer.Trust;
 using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Reflection;
+using System.Runtime.CompilerServices;
+using System.Text;
 
 namespace CMZDedicatedSteamServer
 {
@@ -47,7 +50,8 @@ namespace CMZDedicatedSteamServer
         ServerPluginManager plugins = null,
         bool logHostMessages = false,
         int gameMode = 1,
-        Func<float> getTimeOfDay = null)
+        Func<float> getTimeOfDay = null,
+        ServerPolicy trustPolicy = null)
     {
         #region Fields
 
@@ -57,6 +61,30 @@ namespace CMZDedicatedSteamServer
         /// Enables verbose host/world mutation logging.
         /// </summary>
         private readonly bool _logHostMessages = logHostMessages;
+
+        #endregion
+
+        #region Embedded starter inventory
+
+        /// <summary>
+        /// Vanilla survival starter kit as raw PlayerInventory.Save bytes
+        /// (PINV blob): StonePickAxe, Compass, Pistol, Knife, Bullets x200,
+        /// Torch x16. Used when no template file can be read.
+        /// </summary>
+        private static readonly byte[] EmbeddedDefaultInventory = new byte[]
+        {
+            0x04, 0x50, 0x49, 0x4e, 0x56, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00,
+            0x00, 0x01, 0x17, 0x00, 0x01, 0x00, 0x00, 0x00, 0x80, 0x3f, 0x01, 0x27,
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x80, 0x3f, 0x01, 0x33, 0x00, 0x01, 0x00,
+            0x00, 0x00, 0x80, 0x3f, 0x08, 0x00, 0x00, 0x00, 0x01, 0x31, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x80, 0x3f, 0x01, 0x2c, 0x00, 0xc8, 0x00, 0x00, 0x00,
+            0x80, 0x3f, 0x01, 0x0e, 0x00, 0x10, 0x00, 0x00, 0x00, 0x80, 0x3f, 0x00,
+            0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+        };
 
         #endregion
 
@@ -75,7 +103,41 @@ namespace CMZDedicatedSteamServer
         private readonly string _gamePath = gamePath ?? throw new ArgumentNullException(nameof(gamePath));
 
         /// <summary>Logging callback supplied by the host.</summary>
-        private readonly Action<string> _log = log ?? (_ => { });
+        private readonly Action<string> _log = CreateLog(logHostMessages, log);
+
+        /// <summary>Markers that keep a 'ServerWorld:' line visible without verbose logging.</summary>
+        private static readonly string[] AlwaysShowMarkers =
+        {
+            "inner", "not found", "warn", "unread", "fail", "invalid", "ignore",
+            "error", "null", "requir", "cannot", "denied", "reject", "except",
+            "empty", "skipp", "missing", "final",
+        };
+
+        private static Action<string> CreateLog(bool verboseEnabled, Action<string> sink)
+        {
+            sink ??= _ => { };
+            return msg =>
+            {
+                if (verboseEnabled || !IsRoutineMessage(msg))
+                    sink(msg);
+            };
+        }
+
+        private static bool IsRoutineMessage(string msg)
+        {
+            if (string.IsNullOrEmpty(msg))
+                return false;
+            if (msg.StartsWith("[HostMsg]", StringComparison.Ordinal))
+                return true;
+            if (!msg.StartsWith("ServerWorld:", StringComparison.Ordinal))
+                return false;
+            foreach (string marker in AlwaysShowMarkers)
+            {
+                if (msg.IndexOf(marker, StringComparison.OrdinalIgnoreCase) >= 0)
+                    return false;
+            }
+            return true;
+        }
 
         /// <summary>Configured radius used by the spawn-based chunk-list builder.</summary>
         private readonly int _viewRadiusChunks = viewRadiusChunks < 2 ? 2 : (viewRadiusChunks > 32 ? 32 : viewRadiusChunks);
@@ -236,6 +298,59 @@ namespace CMZDedicatedSteamServer
         /// </summary>
         private DateTime _nextDragonAllowedUtc = DateTime.MinValue;
 
+        /// <summary>
+        /// Vanilla game mode id for DragonEndurance (wave-spawned dragons).
+        /// </summary>
+        private const int DragonEnduranceGameMode = 2;
+
+        /// <summary>
+        /// Vanilla EnemyManager.dragonDistances — horizontal distance from world
+        /// origin that triggers the next biome/distance dragon, mapped to
+        /// DragonTypeEnum FIRE/FOREST/LIZARD/ICE/SKELETON by index.
+        /// </summary>
+        private static readonly float[] DragonDistanceThresholds = [100f, 500f, 1000f, 2600f, 4000f];
+
+        /// <summary>
+        /// Per-player dragon schedule — mirrors the state each vanilla client
+        /// keeps in EnemyManager for its own CheckDragonBox + distance index.
+        /// </summary>
+        private sealed class PlayerDragonSchedule
+        {
+            /// <summary>Next index into DragonDistanceThresholds (0..5).</summary>
+            public int DistanceIndex;
+
+            /// <summary>Next timed dragon type for this player's box (0..5; 5 = COUNT = done).</summary>
+            public int NextTimedType;
+
+            /// <summary>When the timed wait for NextTimedType expires.</summary>
+            public DateTime NextTimedUtc;
+
+            /// <summary>Center of this player's ±500 dragon box.</summary>
+            public float BoxX, BoxZ;
+
+            /// <summary>Last position seen — detects teleport jumps for the index rewind.</summary>
+            public float LastX, LastZ;
+            public bool HasLast;
+        }
+
+        private readonly Dictionary<byte, PlayerDragonSchedule> _dragonSchedules = [];
+
+        /// <summary>DragonEndurance wave: next type in the FIRE..SKELETON cycle.</summary>
+        private int _enduranceNextDragonType;
+
+        /// <summary>DragonEndurance wave: escalating health (25 start, +100/spawn, -15/kill).</summary>
+        private float _enduranceDragonHealth = 25f;
+
+        /// <summary>DragonEndurance wave: next allowed wave time. MinValue = due immediately.</summary>
+        private DateTime _nextEnduranceDragonUtc = DateTime.MinValue;
+
+        /// <summary>
+        /// Set when the dragon controller disconnects — the tick broadcast path
+        /// emits RemoveDragonMessage so every client drops the orphaned entity
+        /// (vanilla migrates the dragon; removal is the safe approximation).
+        /// </summary>
+        private bool _pendingDragonRemoveBroadcast;
+
         #endregion
 
         #region Endurance Auto Restart State
@@ -250,6 +365,19 @@ namespace CMZDedicatedSteamServer
         /// Endurance is 0 in vanilla GameModeTypes.
         /// </summary>
         private readonly int _gameMode = gameMode;
+
+        /// <summary>
+        /// Built-in trust enforcement consulted before any host-destined gameplay
+        /// message is applied or relayed. Null disables the checks.
+        /// </summary>
+        private readonly ServerPolicy _trustPolicy = trustPolicy;
+
+        /// <summary>
+        /// Headless copy of the vanilla terrain generator used by the trust layer
+        /// to prove whether a position has real ground support beneath it.
+        /// Created during Init once WorldInfo (and its seed) is available.
+        /// </summary>
+        private TerrainProbe _terrainProbe;
 
         /// <summary>
         /// Reads the server's authoritative day/time value so auto-restart can restore time after RestartLevelMessage.
@@ -344,8 +472,27 @@ namespace CMZDedicatedSteamServer
 
                 InitSaveDevice();
                 InitInventoryRegistry();
+
+                if (_trustPolicy != null)
+                {
+                    ItemPolicy.Initialize(
+                        ResolveType("DNA.CastleMinerZ.Inventory.InventoryItemIDs"),
+                        ResolveType("DNA.CastleMinerZ.Terrain.BlockTypeEnum"),
+                        _gameAsm,
+                        _log);
+                    _trustPolicy.SetBaselineProvider(LoadBaselineItemCounts);
+                    _trustPolicy.SetSpawnerLocator(IsNearRegisteredSpawner);
+                    _trustPolicy.SetSavedBlockLookup(TryGetSavedBlockType);
+                }
+
                 LoadWorldInfo();
                 ReadSpawnHintFromWorldInfo();
+
+                if (_trustPolicy != null && _worldInfo != null && _gameAsm != null)
+                {
+                    _terrainProbe = new TerrainProbe(_gameAsm, _commonAsm, _worldInfo, _gameMode, _log, TryGetSavedBlockType);
+                    _trustPolicy.SetWorldBlockProbe(_terrainProbe.TryProbeBlockType);
+                }
             }
             catch (Exception ex)
             {
@@ -354,13 +501,31 @@ namespace CMZDedicatedSteamServer
         }
 
         /// <summary>
-        /// Initializes the vanilla InventoryItem registry with headless-safe placeholder item classes.
+        /// Terrain-truth lookup for the trust layer: asks whether real terrain (or a
+        /// saved player edit) occupies space within scanDepth blocks below the feet.
+        /// </summary>
+        internal SupportProbeResult ProbeSupport(float feetX, float feetY, float feetZ, int scanDepth)
+        {
+            return _terrainProbe != null
+                ? _terrainProbe.ProbeSupport(feetX, feetY, feetZ, scanDepth)
+                : SupportProbeResult.Unknown;
+        }
+
+        /// <summary>
+        /// Initializes the vanilla InventoryItem registry with headless-safe item classes that
+        /// preserve each item's real wire shape.
         /// </summary>
         /// <remarks>
         /// The normal game calls InventoryItem.Initalize(ContentManager), but that initializer creates
         /// render/model-heavy item classes and some of them directly access CastleMinerZGame.Instance.
-        /// The dedicated server only needs item classes for crate/inventory serialization, so lightweight
-        /// placeholder classes are enough as long as each placeholder preserves the correct InventoryItemIDs.
+        /// The dedicated server only needs item classes for crate/inventory serialization, so it
+        /// registers metadata-only classes: guns become GunInventoryItemClass (model=null) so the
+        /// int32 clip payload round-trips, GPS items become GPSItemClass (created through a patched
+        /// factory because the real item constructor opens a UI), spawn/teleport blocks get a real
+        /// BlockInventoryItemClass bound to their actual block type so the Vector3/string payloads
+        /// deserialize, and everything else becomes a generic ModelInventoryItemClass carrying the
+        /// policy's per-item stack limit. No render assets are loaded; the crate byte-for-byte
+        /// round-trip check remains enforced on top of this.
         /// </remarks>
         private void InitInventoryRegistry()
         {
@@ -379,7 +544,7 @@ namespace CMZDedicatedSteamServer
 
                 if (inventoryItemIdsType == null)
                 {
-                    _log("ServerWorld: InventoryItemIDs type not found.");
+                    _log("ServerWorld: InventoryItemIDs enum not found.");
                     return;
                 }
 
@@ -424,7 +589,25 @@ namespace CMZDedicatedSteamServer
                     return;
                 }
 
-                ConstructorInfo placeholderCtor = blockInventoryItemClassType.GetConstructor(
+                // The GPS item constructor opens a keyboard UI; install the headless
+                // factory before any class that could route through it registers.
+                // A failure must abort registration (outer catch) - advertising a
+                // GPS class whose CreateItem can't run is worse than no registry.
+                ServerPatches.InstallHeadlessGpsFactory(_gameAsm);
+
+                Type gunItemClassType = ResolveType("DNA.CastleMinerZ.Inventory.GunInventoryItemClass");
+                Type gpsItemClassType = ResolveType("DNA.CastleMinerZ.Inventory.GPSItemClass");
+                Type modelItemClassType = ResolveType("DNA.CastleMinerZ.Inventory.ModelInventoryItemClass");
+                Type toolMaterialType = ResolveType("DNA.CastleMinerZ.ToolMaterialTypes");
+
+                if (gunItemClassType == null || gpsItemClassType == null ||
+                    modelItemClassType == null || toolMaterialType == null)
+                {
+                    _log("ServerWorld: headless item class types not found (gun/gps/model/material).");
+                    return;
+                }
+
+                ConstructorInfo blockCtor = blockInventoryItemClassType.GetConstructor(
                     BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
                     null,
                     [
@@ -435,13 +618,34 @@ namespace CMZDedicatedSteamServer
                     ],
                     null);
 
-                if (placeholderCtor == null)
+                ConstructorInfo gunCtor = null;
+                ConstructorInfo gpsCtor = null;
+                ConstructorInfo modelCtor = null;
+
+                foreach (ConstructorInfo c in gunItemClassType.GetConstructors(
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+                    if (c.GetParameters().Length == 11) { gunCtor = c; break; }
+
+                foreach (ConstructorInfo c in gpsItemClassType.GetConstructors(
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+                    if (c.GetParameters().Length == 4) { gpsCtor = c; break; }
+
+                foreach (ConstructorInfo c in modelItemClassType.GetConstructors(
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+                    if (c.GetParameters().Length == 7) { modelCtor = c; break; }
+
+                if (blockCtor == null || gunCtor == null || gpsCtor == null || modelCtor == null)
                 {
-                    _log("ServerWorld: BlockInventoryItemClass placeholder constructor not found.");
+                    _log("ServerWorld: required headless item class constructor not found.");
                     return;
                 }
 
-                object dirtBlockType = Enum.Parse(blockTypeEnumType, "Dirt");
+                // The default Color instance comes from the constructor's own
+                // parameter type so no XNA assembly reference is needed here.
+                object defaultColor = Activator.CreateInstance(modelCtor.GetParameters()[6].ParameterType);
+                object ironMaterial = Enum.Parse(toolMaterialType, "Iron");
+                object spawnBlockType = Enum.Parse(blockTypeEnumType, "SpawnPointBasic");
+                object teleportBlockType = Enum.Parse(blockTypeEnumType, "TeleportStation");
 
                 int registered = 0;
 
@@ -449,22 +653,57 @@ namespace CMZDedicatedSteamServer
                 {
                     try
                     {
-                        // Server-only placeholder.
-                        // WARNING:
-                        // The ID alone is not enough for every item. Some vanilla item types, such as guns,
-                        // GPS items, teleport blocks, and spawn blocks, serialize extra fields in Write/Read.
-                        // Crate updates must therefore be byte-for-byte round-trip validated before being
-                        // saved to world.info. If the placeholder class would drop bytes, the crate packet
-                        // must be rejected instead of persisted.
-                        object placeholderClass = placeholderCtor.Invoke(
-                        [
-                            itemId,
-                            dirtBlockType,
-                            "Server placeholder item class",
-                            0.01f
-                        ]);
+                        string name = Enum.GetName(inventoryItemIdsType, itemId);
+                        object itemClass;
 
-                        registerMethod.Invoke(null, [placeholderClass]);
+                        if (name != null && ItemPolicy.HasGunPayload(name))
+                        {
+                            // Guns serialize an int32 clip after the base fields;
+                            // GunInventoryItemClass (model=null) produces
+                            // GunInventoryItem whose Read/Write covers it.
+                            itemClass = gunCtor.Invoke(
+                            [
+                                itemId, null, name, "Server serialization metadata",
+                                TimeSpan.FromSeconds(0.1), ironMaterial, 0f, 0f, null, "", ""
+                            ]);
+                        }
+                        else if (name == "GPS" || name == "TeleportGPS")
+                        {
+                            // GPS payloads append Vector3 + string; items are built
+                            // by the patched factory so no UI is constructed.
+                            itemClass = gpsCtor.Invoke(
+                            [
+                                itemId, null, name, "Server serialization metadata"
+                            ]);
+                        }
+                        else if (name == "SpawnBasic" || name == "TeleportStation")
+                        {
+                            // Spawn/teleport blocks serialize Vector3 (both) and a
+                            // station name (teleport only); the real block type is
+                            // what selects those fields in BlockInventoryItem.Read/Write.
+                            itemClass = blockCtor.Invoke(
+                            [
+                                itemId,
+                                name == "SpawnBasic" ? spawnBlockType : teleportBlockType,
+                                "Server serialization metadata",
+                                0.01f
+                            ]);
+                        }
+                        else
+                        {
+                            // Generic serialization metadata class. It registers no
+                            // BlockClasses entry, so nothing claims a fake block
+                            // mapping; HeadlessStackLimit keeps IsValid() consistent
+                            // with the per-slot policy ceilings.
+                            itemClass = modelCtor.Invoke(
+                            [
+                                itemId, null, name, "Server serialization metadata",
+                                ItemPolicy.HeadlessStackLimit(name),
+                                TimeSpan.FromSeconds(0.1), defaultColor
+                            ]);
+                        }
+
+                        registerMethod.Invoke(null, [itemClass]);
                         registered++;
                     }
                     catch (Exception ex)
@@ -474,7 +713,7 @@ namespace CMZDedicatedSteamServer
                             : ex;
 
                         _log(
-                            "ServerWorld: Failed to register placeholder inventory item " +
+                            "ServerWorld: Failed to register headless inventory item " +
                             itemId +
                             ": " +
                             inner.GetType().FullName +
@@ -565,12 +804,15 @@ namespace CMZDedicatedSteamServer
 
                 if (!ok || worldInfo == null)
                 {
-                    _log("ServerWorld: FAILED to load world.info via SaveDevice. Trying world.info.bak...");
-
                     string backupPath = Path.Combine(_worldFolder, "world.info.bak");
+                    bool primaryExists = PhysicalSaveFileExists(relativePath);
+                    bool backupExists = PhysicalSaveFileExists(backupPath);
+
+                    if (primaryExists)
+                        _log("ServerWorld: FAILED to load world.info via SaveDevice. Trying world.info.bak...");
 
                     object backupWorldInfo = null;
-                    bool backupOk = InvokeSaveDeviceLoad(backupPath, stream =>
+                    bool backupOk = backupExists && InvokeSaveDeviceLoad(backupPath, stream =>
                     {
                         using var reader = new BinaryReader(stream);
 
@@ -584,11 +826,38 @@ namespace CMZDedicatedSteamServer
 
                     if (!backupOk || backupWorldInfo == null)
                     {
-                        _log("ServerWorld: FAILED to load world.info.bak.");
+                        _log(primaryExists || backupExists
+                            ? "ServerWorld: world.info unreadable and no usable backup; generating a new world."
+                            : "ServerWorld: no world found; generating a new one.");
+                        CreateNewWorldInfo(worldInfoType);
                         return;
                     }
 
                     _worldInfo = backupWorldInfo;
+
+                    try
+                    {
+                        var savePathProp = worldInfoType.GetProperty(
+                            "SavePath",
+                            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+                        if (savePathProp != null && savePathProp.CanWrite)
+                        {
+                            savePathProp.SetValue(_worldInfo, _worldFolder, null);
+                        }
+                        else
+                        {
+                            var savePathField = worldInfoType.GetField(
+                                "_savePath",
+                                BindingFlags.NonPublic | BindingFlags.Instance);
+
+                            savePathField?.SetValue(_worldInfo, _worldFolder);
+                        }
+                    }
+                    catch
+                    {
+                    }
+
                     _log("ServerWorld: Recovered WorldInfo from world.info.bak.");
                     return;
                 }
@@ -630,6 +899,83 @@ namespace CMZDedicatedSteamServer
             {
                 _log("ServerWorld LoadWorldInfo: " + ex.GetType().FullName + ": " + ex.Message);
                 _log(ex.StackTrace ?? "(no stack trace)");
+            }
+        }
+
+        /// <summary>
+        /// No world.info anywhere: generate a fresh world via the game's own
+        /// WorldInfo.CreateNewWorld(seed), point it at our folder, and save it
+        /// through the normal atomic path so next boot loads it normally.
+        /// </summary>
+        private void CreateNewWorldInfo(Type worldInfoType)
+        {
+            try
+            {
+                MethodInfo createM = worldInfoType.GetMethod(
+                    "CreateNewWorld",
+                    BindingFlags.Public | BindingFlags.Static,
+                    null,
+                    [typeof(int)],
+                    null);
+
+                if (createM == null)
+                {
+                    _log("ServerWorld: WorldInfo.CreateNewWorld(int) not found; cannot auto-create world.");
+                    return;
+                }
+
+                int seed = new Random().Next();
+                _worldInfo = createM.Invoke(null, [seed]);
+
+                try
+                {
+                    var savePathProp = worldInfoType.GetProperty(
+                        "SavePath",
+                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+                    if (savePathProp != null && savePathProp.CanWrite)
+                    {
+                        savePathProp.SetValue(_worldInfo, _worldFolder, null);
+                    }
+                    else
+                    {
+                        var savePathField = worldInfoType.GetField(
+                            "_savePath",
+                            BindingFlags.NonPublic | BindingFlags.Instance);
+
+                        savePathField?.SetValue(_worldInfo, _worldFolder);
+                    }
+
+                    // CreateNewWorld(int) passes a null creator, leaving the
+                    // owner/creator tags null; WorldInfo.Save writes them with
+                    // BinaryWriter.Write(string) and throws on null. In the
+                    // client this never happens because a gamer is always
+                    // signed in, so give the fresh world a non-null tag here.
+                    var ownerField = worldInfoType.GetField(
+                        "_ownerGamerTag",
+                        BindingFlags.NonPublic | BindingFlags.Instance);
+                    var creatorField = worldInfoType.GetField(
+                        "_creatorGamerTag",
+                        BindingFlags.NonPublic | BindingFlags.Instance);
+
+                    ownerField?.SetValue(_worldInfo, "CastleForge");
+                    creatorField?.SetValue(_worldInfo, "CastleForge");
+                }
+                catch
+                {
+                }
+
+                SaveWorldInfo();
+                _log($"ServerWorld: created new world (seed {seed}).");
+            }
+            catch (TargetInvocationException tie)
+            {
+                Exception inner = tie.InnerException ?? tie;
+                _log("ServerWorld CreateNewWorldInfo inner: " + inner.GetType().FullName + ": " + inner.Message);
+            }
+            catch (Exception ex)
+            {
+                _log("ServerWorld CreateNewWorldInfo: " + ex.GetType().FullName + ": " + ex.Message);
             }
         }
 
@@ -732,6 +1078,48 @@ namespace CMZDedicatedSteamServer
         /// - World-info, chunk-list, chunk-data, and inventory-request/store messages are host-consumed.
         /// - Several mutation messages are applied on the host and then still relayed to peers.
         /// </summary>
+        /// <summary>
+        /// Trust gate for messages that are relayed peer-to-peer rather than
+        /// consumed by the host (e.g. melee sent straight to the victim).
+        /// Returns false when the message must be dropped before relay.
+        /// </summary>
+        public bool AllowRelayedMessage(
+            byte senderId,
+            string typeName,
+            byte[] data,
+            bool isPeerDirected,
+            Func<string> resolveName,
+            Func<ulong> resolveRemoteId)
+        {
+            return _trustPolicy == null ||
+                   _trustPolicy.AllowRelayedMessage(senderId, typeName, data, isPeerDirected, resolveName, resolveRemoteId);
+        }
+
+        /// <summary>
+        /// Records a forged host-authority message as a trust violation.
+        /// </summary>
+        public void NotifyForgedHostAuthority(
+            byte senderId,
+            string typeName,
+            Func<string> resolveName,
+            Func<ulong> resolveRemoteId)
+        {
+            _trustPolicy?.NotifyForgedHostAuthority(senderId, typeName, resolveName, resolveRemoteId);
+        }
+
+        /// <summary>
+        /// Records a malformed wire packet (bad length prefixes, truncated
+        /// payload) as a protocol violation on the transport sender.
+        /// </summary>
+        public void NotifyMalformedPacket(
+            byte senderId,
+            string detail,
+            Func<string> resolveName,
+            Func<ulong> resolveRemoteId)
+        {
+            _trustPolicy?.NotifyMalformedPacket(senderId, detail, resolveName, resolveRemoteId);
+        }
+
         public bool TryHandleHostMessage(
             byte recipientId,
             byte senderId,
@@ -750,6 +1138,39 @@ namespace CMZDedicatedSteamServer
             byte messageId = data[0];
             if (!_messageIdToType.TryGetValue(messageId, out string typeName))
                 return false;
+
+            // Built-in trust layer: validates the message against the server's own
+            // authority before anything applies or relays it. Dropping returns true
+            // (consumed) so illegal input is never seen by other clients.
+            if (_trustPolicy != null &&
+                !_trustPolicy.AllowMessage(
+                    senderId,
+                    typeName,
+                    data,
+                    () => ResolveSenderGamertag(senderId, senderConn, connectionToGamer),
+                    () => TryConvertSenderConnectionToRemoteId(senderConn)))
+            {
+                ApplyPendingRestores(senderId, connections, connectionToGamer, sendToClient);
+                return true;
+            }
+
+            // Reach check: mutation messages carry a world target; it must be near
+            // the position the server last accepted for this player.
+            if (_trustPolicy != null &&
+                _trustPolicy.NeedsReachCheck(typeName) &&
+                TryExtractEditTarget(typeName, data, out float targetX, out float targetY, out float targetZ) &&
+                !_trustPolicy.AllowEditAt(
+                    senderId,
+                    typeName,
+                    data,
+                    targetX,
+                    targetY,
+                    targetZ,
+                    () => ResolveSenderGamertag(senderId, senderConn, connectionToGamer),
+                    () => TryConvertSenderConnectionToRemoteId(senderConn)))
+            {
+                return true;
+            }
 
             // Consumed by host, not relayed.
             // These messages are direct client-to-host requests. The host answers them and stops relay.
@@ -824,8 +1245,7 @@ namespace CMZDedicatedSteamServer
                 if (TryRunWorldPlugins(typeName, senderId, data, senderConn, connectionToGamer, sendToClient))
                     return true;
 
-                HandleRemoveBlocksMessage(senderId, data);
-                return false;
+                return HandleRemoveBlocksMessage(senderId, data, senderConn, connectionToGamer);
             }
 
             if (typeName == "DNA.CastleMinerZ.Net.DestroyCustomBlockMessage")
@@ -903,7 +1323,7 @@ namespace CMZDedicatedSteamServer
 
             if (typeName == "DNA.CastleMinerZ.Net.KillDragonMessage")
             {
-                ClearActiveDragon($"KillDragonMessage from player {senderId}");
+                ClearActiveDragon($"KillDragonMessage from player {senderId}", killed: true);
                 return false; // still relay so clients play death/pickup behavior
             }
 
@@ -913,7 +1333,95 @@ namespace CMZDedicatedSteamServer
                 return false; // still relay so clients remove it too
             }
 
+            // Dragon control traffic (AI waypoints, attacks, host migration) is
+            // only ever sent by the client currently running DragonEntity.
+            // Anything else is consumed so forged updates can't reach other
+            // clients; migration adopts the new controller like vanilla.
+            if (typeName == "DNA.CastleMinerZ.Net.MigrateDragonMessage" ||
+                typeName == "DNA.CastleMinerZ.Net.UpdateDragonMessage" ||
+                typeName == "DNA.CastleMinerZ.Net.DragonAttackMessage")
+            {
+                lock (_dragonStateLock)
+                {
+                    if (!_dragonActive)
+                        return true; // stale post-removal traffic
+
+                    if (_dragonControllerId != senderId)
+                        return true; // not the controller: drop, never relay
+
+                    if (typeName == "DNA.CastleMinerZ.Net.MigrateDragonMessage" && data.Length >= 3)
+                    {
+                        byte newController = data[data.Length - 2];
+                        _dragonControllerId = newController;
+                        _log($"[Dragon] Control migrated from {senderId} to player {newController}.");
+                    }
+                }
+                return false; // relay legitimate control traffic
+            }
+
             return false;
+        }
+
+        /// <summary>
+        /// Extracts the world-space target position carried by a mutation message.
+        /// Field names come from the decompiled message classes (AlterBlock.BlockLocation,
+        /// Dig.Location, RemoveBlocks.BlocksToRemove, etc.).
+        /// </summary>
+        private bool TryExtractEditTarget(string typeName, byte[] data, out float x, out float y, out float z)
+        {
+            x = y = z = 0f;
+
+            string member;
+            switch (typeName)
+            {
+                case "DNA.CastleMinerZ.Net.AlterBlockMessage":
+                    member = "BlockLocation";
+                    break;
+                case "DNA.CastleMinerZ.Net.DigMessage":
+                    member = "Location";
+                    break;
+                case "DNA.CastleMinerZ.Net.RemoveBlocksMessage":
+                    member = "BlocksToRemove";
+                    break;
+                case "DNA.CastleMinerZ.Net.DestroyCustomBlockMessage":
+                case "DNA.CastleMinerZ.Net.DestroyCrateMessage":
+                case "DNA.CastleMinerZ.Net.ItemCrateMessage":
+                case "DNA.CastleMinerZ.Net.DetonateExplosiveMessage":
+                    member = "Location";
+                    break;
+                case "DNA.CastleMinerZ.Net.CreatePickupMessage":
+                case "DNA.CastleMinerZ.Net.SpawnEnemyMessage":
+                    member = "SpawnPosition";
+                    break;
+                default:
+                    return false;
+            }
+
+            object msg = DeserializeGameMessage(typeName, data);
+            if (msg == null)
+                return false;
+
+            object value = GetMemberValue(msg, member);
+            if (value == null)
+                return false;
+
+            // RemoveBlocks carries an IntVector3[] of targets; checking the first is
+            // enough since a batch sits within the same small area.
+            if (value is Array arr && arr.Length > 0)
+                value = arr.GetValue(0);
+
+            if (value == null)
+                return false;
+
+            if (TryReadIntVector3(value, out int ix, out int iy, out int iz))
+            {
+                x = ix;
+                y = iy;
+                z = iz;
+                return true;
+            }
+
+            return TryReadVector3(value, out x, out y, out z);
         }
 
         /// <summary>
@@ -921,6 +1429,8 @@ namespace CMZDedicatedSteamServer
         /// </summary>
         public void OnClientDisconnected(byte playerId)
         {
+            _trustPolicy?.RemovePlayer(playerId);
+
             _chunkRequestLoggedForPlayer.Remove(playerId);
 
             _enduranceDeadByPlayerId.Remove(playerId);
@@ -928,12 +1438,13 @@ namespace CMZDedicatedSteamServer
 
             lock (_dragonStateLock)
             {
+                _dragonSchedules.Remove(playerId);
+
                 if (_dragonActive && _dragonControllerId == playerId)
                 {
-                    _log($"[Dragon] Controller player {playerId} disconnected. Clearing active dragon state.");
-                    _dragonActive = false;
-                    _activeDragonHealth = -1f;
-                    _nextDragonAllowedUtc = DateTime.UtcNow.AddSeconds(8);
+                    _log($"[Dragon] Controller player {playerId} disconnected. Broadcasting RemoveDragonMessage.");
+                    ClearActiveDragon($"controller {playerId} disconnected");
+                    _pendingDragonRemoveBroadcast = true;
                 }
             }
         }
@@ -1157,6 +1668,8 @@ namespace CMZDedicatedSteamServer
         {
             try
             {
+                _log("ServerWorld: RequestInventory from player " + senderId + ".");
+
                 if (senderConn == null)
                 {
                     _log("ServerWorld: RequestInventory senderConn was null.");
@@ -1165,12 +1678,24 @@ namespace CMZDedicatedSteamServer
 
                 if (!connectionToGamer.TryGetValue(senderConn, out var gamer) || gamer == null)
                 {
-                    _log("ServerWorld: RequestInventory gamer not found.");
+                    _log("ServerWorld: RequestInventory gamer not found for player " + senderId + ".");
                     return;
                 }
 
                 bool isDefault = false;
                 byte[] invBytes = LoadRawInventoryBytesForGamer(gamer);
+
+                // A saved inventory that parses to zero items is a corrupt/empty
+                // state (e.g. a client saved bare hands after a failed join).
+                // Treat it as no save at all so the player gets the starter kit
+                // instead of being locked into empty hands on every join.
+                if (invBytes != null && invBytes.Length > 0 &&
+                    ItemPolicy.TrySummarizeInventory(invBytes, out Dictionary<int, int> totals) &&
+                    (totals == null || totals.Count == 0))
+                {
+                    _log("ServerWorld: Saved inventory for player " + senderId + " is empty; serving default instead.");
+                    invBytes = null;
+                }
 
                 if (invBytes == null || invBytes.Length == 0)
                 {
@@ -1180,19 +1705,22 @@ namespace CMZDedicatedSteamServer
 
                 if (invBytes == null || invBytes.Length == 0)
                 {
-                    _log("ServerWorld: Failed to get inventory bytes.");
+                    _log("ServerWorld: RequestInventory: no saved or default inventory bytes available for player " + senderId + ".");
                     return;
                 }
+
+                // Trust layer: the served inventory becomes the provenance baseline.
+                _trustPolicy?.NotifyInventoryServed(senderId, invBytes);
 
                 byte[] payload = BuildInventoryRetrieveFromServerPayload(invBytes, senderId, isDefault);
                 if (payload == null || payload.Length == 0)
                 {
-                    _log("ServerWorld: Failed to build InventoryRetrieveFromServerMessage payload.");
+                    _log("ServerWorld: RequestInventory: failed to build InventoryRetrieveFromServerMessage payload for player " + senderId + ".");
                     return;
                 }
 
                 sendToClient(senderConn, payload, senderId);
-                _log("ServerWorld: Sent inventory to player " + senderId + (isDefault ? " [default]" : ""));
+                _log("ServerWorld: Sent inventory to player " + senderId + " (len=" + invBytes.Length + ")" + (isDefault ? " [default]" : "") + ".");
             }
             catch (Exception ex)
             {
@@ -1227,13 +1755,34 @@ namespace CMZDedicatedSteamServer
                     result = ms.ToArray();
                 });
 
-                if (!ok || result == null || result.Length == 0)
+                if (ok && result != null && result.Length > 0)
+                    return result;
+
+                // Keyed .inv files are encrypted to the save-owner SteamID that
+                // wrote them, so a shipped template can fail to decrypt under a
+                // different owner's key. The plaintext payload is the universal
+                // fallback: raw PlayerInventory.Save bytes, no container.
+                string plainPath = Path.Combine(_saveRoot, "Inventory", "default.bin");
+                try
                 {
-                    _log("ServerWorld: Failed to load default inventory template from " + relativePath);
-                    return null;
+                    if (File.Exists(plainPath))
+                    {
+                        byte[] plain = File.ReadAllBytes(plainPath);
+                        if (plain.Length > 0)
+                        {
+                            _log("ServerWorld: Using plaintext default inventory template (keyed DEFAULT.inv unreadable).");
+                            return plain;
+                        }
+                    }
+                }
+                catch
+                {
                 }
 
-                return result;
+                // Last resort: the vanilla starter kit baked into the binary.
+                // Always available regardless of filesystem/sandbox state.
+                _log("ServerWorld: Using embedded default inventory (no readable template file).");
+                return EmbeddedDefaultInventory;
             }
             catch (Exception ex)
             {
@@ -1310,6 +1859,74 @@ namespace CMZDedicatedSteamServer
 
                 _log("ServerWorld HandleInventoryStoreOnServerMessage: " + inner.GetType().FullName + ": " + inner.Message);
                 _log(inner.StackTrace ?? "(no stack trace)");
+            }
+        }
+
+        /// <summary>
+        /// Trust-layer baseline: resolves a player's previously persisted inventory
+        /// (SteamID-hash file, then gamertag-hash file, then the new-player
+        /// template) into item-id totals for provenance reconciliation.
+        /// </summary>
+        private Dictionary<int, int> LoadBaselineItemCounts(ulong remoteId, string name)
+        {
+            try
+            {
+                byte[] bytes = null;
+                if (remoteId != 0)
+                {
+                    bytes = TryLoadRawFileFromStorage(
+                        Path.Combine(_worldFolder,
+                            ComputeVanillaHashString(remoteId.ToString(CultureInfo.InvariantCulture)) + ".inv"));
+                }
+                if (bytes == null && !string.IsNullOrWhiteSpace(name) && name != "Player")
+                {
+                    bytes = TryLoadRawFileFromStorage(
+                        Path.Combine(_worldFolder, ComputeVanillaHashString(name) + ".inv"));
+                }
+                bytes ??= LoadDefaultInventoryTemplate();
+
+                return ItemPolicy.TrySummarizeInventory(bytes, out Dictionary<int, int> totals)
+                    ? totals
+                    : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Reads a reflected Crate's Inventory array and reports its contents to
+        /// the trust layer as expected spill pickups for the breaking player.
+        /// </summary>
+        private void TryNotifyCrateSpill(byte senderId, object crate)
+        {
+            try
+            {
+                if (_trustPolicy == null || !(GetMemberValue(crate, "Inventory") is Array inv))
+                    return;
+
+                var items = new List<ItemPolicy.ParsedItem>();
+                foreach (object it in inv)
+                {
+                    if (it == null)
+                        continue;
+                    object idObj = GetMemberValue(GetMemberValue(it, "ItemClass"), "ID");
+                    object stackObj = GetMemberValue(it, "StackCount");
+                    if (idObj == null || stackObj == null)
+                        continue;
+                    items.Add(new ItemPolicy.ParsedItem
+                    {
+                        Id = Convert.ToInt32(idObj, CultureInfo.InvariantCulture),
+                        Stack = Convert.ToInt32(stackObj, CultureInfo.InvariantCulture)
+                    });
+                }
+
+                if (items.Count > 0)
+                    _trustPolicy.NotifyCrateSpill(senderId, items);
+            }
+            catch
+            {
             }
         }
 
@@ -1754,6 +2371,42 @@ namespace CMZDedicatedSteamServer
                         return true;
                     }
 
+                    // Trust layer: settle the slot transfer as a net debit/credit
+                    // against the player's provenance pool. A denied transfer
+                    // consumes the packet so the crate and the ledger stay in
+                    // sync - the old stack is neither credited nor overwritten.
+                    int oldItemId = 0, oldItemCount = 0;
+                    object oldItem = inventory.GetValue(index);
+                    if (oldItem != null)
+                    {
+                        object oldIdObj = GetMemberValue(GetMemberValue(oldItem, "ItemClass"), "ID");
+                        object oldStackObj = GetMemberValue(oldItem, "StackCount");
+                        if (oldIdObj == null || oldStackObj == null)
+                            return true;
+                        oldItemId = Convert.ToInt32(oldIdObj, CultureInfo.InvariantCulture);
+                        oldItemCount = Convert.ToInt32(oldStackObj, CultureInfo.InvariantCulture);
+                    }
+
+                    int newItemId = 0, newItemCount = 0;
+                    if (item != null)
+                    {
+                        object newIdObj = GetMemberValue(GetMemberValue(item, "ItemClass"), "ID");
+                        object newStackObj = GetMemberValue(item, "StackCount");
+                        if (newIdObj == null || newStackObj == null)
+                            return true;
+                        newItemId = Convert.ToInt32(newIdObj, CultureInfo.InvariantCulture);
+                        newItemCount = Convert.ToInt32(newStackObj, CultureInfo.InvariantCulture);
+                    }
+
+                    if (_trustPolicy != null &&
+                        !_trustPolicy.AllowCrateTransfer(senderId, oldItemId, oldItemCount, newItemId, newItemCount))
+                    {
+                        _log(
+                            $"[HostMsg] Rejected ItemCrateMessage from player {senderId}: unowned crate transfer " +
+                            $"{oldItemId}x{oldItemCount} -> {newItemId}x{newItemCount} at {FormatIntVector3(location)}, slot={index}.");
+                        return true;
+                    }
+
                     inventory.SetValue(item, index);
 
                     if (IsCrateEmpty(crate))
@@ -1803,6 +2456,11 @@ namespace CMZDedicatedSteamServer
                 {
                     if (TryDictionaryTryGetValue(crates, location, out object crate) && crate != null)
                     {
+                        // Trust layer: a destroyed crate spills its contents as
+                        // pickups authored by the breaker - credit them first so
+                        // the provenance gate accepts the legitimate spill.
+                        TryNotifyCrateSpill(senderId, crate);
+
                         TrySetMemberValue(crate, "Destroyed", true);
                         TrySetMemberValue(crate, "_destroyed", true);
                         DictionaryRemove(crates, location);
@@ -1873,6 +2531,11 @@ namespace CMZDedicatedSteamServer
 
                 ApplyTerrainBlockChange(x, y, z, blockTypeValue);
 
+                // Placement overlapping a player's body is legitimate (pillaring,
+                // walling in) - tell the trust policy so embedded checks defer.
+                if (blockTypeValue != 0)
+                    _trustPolicy?.NotifyBlockPlaced(senderId, x, y, z);
+
                 if (_logHostMessages)
                 {
                     _log($"[HostMsg] AlterBlockMessage from player {senderId} at ({x},{y},{z}) -> {blockTypeValue}");
@@ -1887,8 +2550,12 @@ namespace CMZDedicatedSteamServer
 
         /// <summary>
         /// Applies a batch of block removals to the authoritative saved terrain delta.
+        /// The trust policy authorizes each cell (blast-correlated or enemy-owned)
+        /// in AllowMessage; only cells it approved are ever applied, and the packet
+        /// is compacted in place so downstream relays only carry authorized cells.
+        /// Returns true when nothing applied - nothing left worth relaying.
         /// </summary>
-        private void HandleRemoveBlocksMessage(byte senderId, byte[] data)
+        private bool HandleRemoveBlocksMessage(byte senderId, byte[] data, object senderConn, Dictionary<object, object> connectionToGamer)
         {
             try
             {
@@ -1897,9 +2564,19 @@ namespace CMZDedicatedSteamServer
                 int numBlocks = Convert.ToInt32(GetMemberValue(msg, "NumBlocks") ?? 0);
 
                 if (GetMemberValue(msg, "BlocksToRemove") is not Array blocks || numBlocks <= 0)
-                    return;
+                    return true;
 
                 int count = Math.Min(numBlocks, blocks.Length);
+
+                // Flag byte sits after the original cell list; save it before
+                // compaction overwrites those bytes.
+                bool enemyDigging = false;
+                int flagOff = 5 + numBlocks * 12;
+                if (data != null && data.Length > flagOff)
+                    enemyDigging = data[flagOff] != 0;
+
+                int writeOff = 5;
+                int applied = 0;
 
                 for (int i = 0; i < count; i++)
                 {
@@ -1907,15 +2584,44 @@ namespace CMZDedicatedSteamServer
                     if (!TryReadIntVector3(location, out int x, out int y, out int z))
                         continue;
 
+                    if (_trustPolicy != null &&
+                        !_trustPolicy.AllowRemoveBlockCell(
+                            senderId,
+                            x, y, z,
+                            () => ResolveSenderGamertag(senderId, senderConn, connectionToGamer),
+                            () => TryConvertSenderConnectionToRemoteId(senderConn)))
+                    {
+                        continue;
+                    }
+
                     ApplyTerrainBlockChange(x, y, z, 0);
+
+                    int cellOff = 5 + i * 12;
+                    if (data != null && data.Length >= flagOff)
+                    {
+                        if (writeOff != cellOff)
+                            Buffer.BlockCopy(data, cellOff, data, writeOff, 12);
+                        writeOff += 12;
+                    }
+                    applied++;
                 }
 
-                _log($"[HostMsg] RemoveBlocksMessage from player {senderId}, count={count}");
+                // Rewrite NumBlocks + flag so the relayed packet describes only
+                // the cells the server actually removed.
+                if (data != null && data.Length >= flagOff)
+                {
+                    Buffer.BlockCopy(BitConverter.GetBytes(applied), 0, data, 1, 4);
+                    data[writeOff] = enemyDigging ? (byte)1 : (byte)0;
+                }
+
+                _log($"[HostMsg] RemoveBlocksMessage from player {senderId}, count={count}, applied={applied}");
+                return applied == 0;
             }
             catch (Exception ex)
             {
                 Exception inner = ex is TargetInvocationException tie && tie.InnerException != null ? tie.InnerException : ex;
                 _log("ServerWorld HandleRemoveBlocksMessage: " + inner.GetType().FullName + ": " + inner.Message);
+                return true;
             }
         }
         #endregion
@@ -1985,6 +2691,44 @@ namespace CMZDedicatedSteamServer
 
             SaveChunkDelta(chunkX, chunkZ, working);
             AddChunkToCache(chunkKey, working);
+        }
+
+        /// <summary>
+        /// Writes back cells the trust layer queued for rollback (the dig that
+        /// seeded a denied chopper batch) and relays a synthetic AlterBlock to
+        /// every connected client so the restored block visibly reappears for
+        /// everyone - the original removal WAS relayed before the burst was
+        /// caught, so leaving it would desync the world until rejoin.
+        /// </summary>
+        private void ApplyPendingRestores(
+            byte senderId,
+            object connections,
+            Dictionary<object, object> connectionToGamer,
+            Action<object, byte[], byte> sendToClient)
+        {
+            var restores = _trustPolicy?.DrainPendingRestores(senderId);
+            if (restores == null)
+                return;
+
+            foreach ((int x, int y, int z, int type) in restores)
+            {
+                ApplyTerrainBlockChange(x, y, z, type);
+                _log($"[Trust] restored block type {type} at {x},{y},{z} after chopper-style denial");
+
+                byte[] payload = BuildAlterBlockMessagePayload(x, y, z, type);
+                if (payload == null || payload.Length == 0 ||
+                    sendToClient == null || connectionToGamer == null ||
+                    !(connections is System.Collections.IEnumerable liveConnections))
+                    continue;
+
+                foreach (var conn in liveConnections)
+                {
+                    if (!connectionToGamer.TryGetValue(conn, out var gamer) || gamer == null)
+                        continue;
+                    byte recipientId = (byte)gamer.GetType().GetProperty("Id").GetValue(gamer);
+                    sendToClient(conn, payload, recipientId);
+                }
+            }
         }
 
         /// <summary>Chunk disk format magic used by newer chunk delta files.</summary>
@@ -2107,6 +2851,19 @@ namespace CMZDedicatedSteamServer
                     string liveRelativePath = Path.Combine(_worldFolder, "world.info");
                     string tempRelativePath = Path.Combine(_worldFolder, "world.info.tmp");
                     string backupRelativePath = Path.Combine(_worldFolder, "world.info.bak");
+
+                    if (!SaveDeviceDirectoryExists(_worldFolder))
+                    {
+                        SaveDeviceCreateDirectory(_worldFolder);
+                    }
+
+                    try
+                    {
+                        Directory.CreateDirectory(Path.GetFullPath(Path.Combine(_saveRoot, _worldFolder)));
+                    }
+                    catch
+                    {
+                    }
 
                     bool ok = InvokeSaveDeviceSave(tempRelativePath, stream =>
                     {
@@ -2478,7 +3235,15 @@ namespace CMZDedicatedSteamServer
 
                 bool displayOnPickup = data[flagsOffset + 1] != 0;
 
-                _pendingPickupsById[pickupId] = new PendingPickup
+                // Bound the pending-pickup table so spammed spawns cannot grow it forever.
+                if (_pendingPickupsById.Count >= 4096)
+                {
+                    _log($"[HostMsg] CreatePickupMessage from player {senderId} ignored; pending pickup table is full.");
+                    return;
+                }
+
+                // The creating player is the vanilla SpawnerID.
+                _pendingPickupsById[PendingPickupKey(senderId, pickupId)] = new PendingPickup
                 {
                     PickupID = pickupId,
                     PickupPositionBytes = pickupPositionBytes,
@@ -2523,12 +3288,29 @@ namespace CMZDedicatedSteamServer
                 int pickupId = Convert.ToInt32(GetMemberValue(msg, "PickupID"));
                 int spawnerId = Convert.ToInt32(GetMemberValue(msg, "SpawnerID"));
 
-                if (!_pendingPickupsById.TryGetValue(pickupId, out PendingPickup pending))
+                long pendingKey = PendingPickupKey(spawnerId, pickupId);
+                if (!_pendingPickupsById.TryGetValue(pendingKey, out PendingPickup pending))
                 {
-                    _log($"[HostMsg] RequestPickupMessage from player {senderId} ignored; unknown pickupId={pickupId}, spawnerId={spawnerId}");
+                    _log($"ServerWorld: RequestPickup from player {senderId} ignored; unknown pickupId={pickupId}, spawnerId={spawnerId}");
                     return;
                 }
 
+                // Trust layer: the pickup must be within reach of the position the
+                // server last accepted for this player - no map-wide vacuum pulls.
+                if (_trustPolicy != null &&
+                    pending.PickupPositionBytes != null &&
+                    pending.PickupPositionBytes.Length >= 12 &&
+                    !_trustPolicy.AllowEditAt(
+                        senderId,
+                        "DNA.CastleMinerZ.Net.RequestPickupMessage",
+                        BitConverter.ToSingle(pending.PickupPositionBytes, 0),
+                        BitConverter.ToSingle(pending.PickupPositionBytes, 4),
+                        BitConverter.ToSingle(pending.PickupPositionBytes, 8),
+                        () => ResolveSenderGamertag(senderId, senderConn, connectionToGamer),
+                        () => TryConvertSenderConnectionToRemoteId(senderConn)))
+                {
+                    return;
+                }
 
                 byte[] consumePayload = BuildConsumePickupMessagePayload(
                     pending.PickupPositionBytes,
@@ -2580,8 +3362,15 @@ namespace CMZDedicatedSteamServer
 
                 if (sentToAnyone)
                 {
-                    _pendingPickupsById.Remove(pickupId);
-                    _log($"[HostMsg] Resolved pickup pickupId={pickupId}, spawnerId={spawnerId}, picker={senderId}");
+                    _pendingPickupsById.Remove(pendingKey);
+
+                    // Trust layer: the granted pickup is an authorized inventory gain.
+                    _trustPolicy?.NotifyPickupGranted(senderId, pending.ItemBytes);
+
+                    string itemDesc = "item ?";
+                    if (ItemPolicy.TryParseItem(pending.ItemBytes, 0, pending.ItemBytes.Length, out ItemPolicy.ParsedItem pit))
+                        itemDesc = $"item {pit.Id} x{pit.Stack}";
+                    _log($"ServerWorld: Resolved pickup pickupId={pickupId}, spawnerId={spawnerId}, picker={senderId}, {itemDesc}");
                 }
                 else
                 {
@@ -2729,6 +3518,32 @@ namespace CMZDedicatedSteamServer
             else
             {
                 File.Move(tempPath, livePath);
+
+                if (!File.Exists(backupPath))
+                {
+                    try
+                    {
+                        File.Copy(livePath, backupPath);
+                    }
+                    catch
+                    {
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Whether a save-device-relative file exists on the physical filesystem.
+        /// </summary>
+        private bool PhysicalSaveFileExists(string relativePath)
+        {
+            try
+            {
+                return File.Exists(Path.GetFullPath(Path.Combine(_saveRoot, relativePath)));
+            }
+            catch
+            {
+                return false;
             }
         }
 
@@ -2746,6 +3561,38 @@ namespace CMZDedicatedSteamServer
             catch
             {
             }
+        }
+
+        /// <summary>
+        /// True when a registered spawner sits at or next to the position.
+        /// Spawner reward blocks convert on the spawner's cell or one of its
+        /// six neighbors (PlaceRewardBlock offsets Location by +/-1 on an axis),
+        /// so a +-1 box is the exact legitimate target set.
+        /// </summary>
+        private bool IsNearRegisteredSpawner(float x, float y, float z)
+        {
+            try
+            {
+                if (_worldInfo == null)
+                    return false;
+
+                if (!(GetMemberValue(_worldInfo, "Spawners") is System.Collections.IDictionary spawners))
+                    return false;
+
+                foreach (object key in spawners.Keys)
+                {
+                    if (!TryReadIntVector3(key, out int sx, out int sy, out int sz))
+                        continue;
+
+                    if (Math.Abs(sx - x) <= 1f && Math.Abs(sy - y) <= 1f && Math.Abs(sz - z) <= 1f)
+                        return true;
+                }
+            }
+            catch
+            {
+            }
+
+            return false;
         }
 
         /// <summary>
@@ -3193,8 +4040,12 @@ namespace CMZDedicatedSteamServer
 
         /// <summary>
         /// Clears active dragon state after a kill, remove, or controller disconnect.
+        /// Mirrors vanilla RemoveDragonEntity: DragonEndurance re-arms the wave
+        /// timer (10-30 s, -15 health per kill); other modes take the 8 s
+        /// cooldown and every player's timed box recenters + re-arms its wait
+        /// (progression is kept — the type already advanced at spawn time).
         /// </summary>
-        private void ClearActiveDragon(string reason)
+        private void ClearActiveDragon(string reason, bool killed = false)
         {
             lock (_dragonStateLock)
             {
@@ -3210,7 +4061,31 @@ namespace CMZDedicatedSteamServer
                 _activeDragonType = 0;
                 _activeDragonForBiome = false;
                 _activeDragonHealth = -1f;
+
+                if (_gameMode == DragonEnduranceGameMode)
+                {
+                    if (killed)
+                        _enduranceDragonHealth -= 15f;
+                    _nextEnduranceDragonUtc =
+                        DateTime.UtcNow.AddSeconds(10.0 + _dragonJitter.NextDouble() * 20.0);
+                    return;
+                }
+
                 _nextDragonAllowedUtc = DateTime.UtcNow.AddSeconds(8);
+
+                List<(byte Id, float X, float Y, float Z)> positions = _trustPolicy?.SnapshotPlayerPositions();
+                if (positions == null)
+                    return;
+
+                foreach ((byte id, float x, float y, float z) in positions)
+                {
+                    if (_dragonSchedules.TryGetValue(id, out PlayerDragonSchedule st))
+                    {
+                        st.BoxX = x;
+                        st.BoxZ = z;
+                        st.NextTimedUtc = DateTime.UtcNow.AddMinutes(DragonWaitMinutes(st.NextTimedType));
+                    }
+                }
             }
         }
 
@@ -3306,6 +4181,166 @@ namespace CMZDedicatedSteamServer
             return ms.ToArray();
         }
 
+        // ======================== Canary enemies ========================
+        //
+        // Server-planted unreachable enemies. Vanilla gives the wire no
+        // damage-report and no enemy-position sync - every client sims its
+        // own copy of each spawn, so "who owns the enemy" proves nothing.
+        // But a spawn the server plants deep in solid rock IS provable:
+        // no bullet ray, melee swing, or blast can reach it, while kill-all
+        // sweeps iterate the local enemy list and claim every id in it.
+        // One KillEnemyMessage naming a canary id = fabricated claim.
+        //
+        // Skeleton/archer types (26-49) are used because their GetDigState
+        // returns GiveUp - only zombies tunnel toward players, so a buried
+        // canary stays sealed instead of digging itself reachable.
+
+        private const int MaxLiveCanaries = 2;
+        private static readonly TimeSpan CanaryLifetime = TimeSpan.FromSeconds(60);
+        private readonly List<(int Id, DateTime PlantedUtc)> _canaries =
+            new List<(int, DateTime)>();
+        private int _canarySeq;
+
+        /// <summary>
+        /// Canary upkeep on the 1 s scheduler tick: retires expired plants
+        /// (KillEnemy broadcast) and keeps up to MaxLiveCanaries planted
+        /// ~40-60 m under a random tracked player.
+        /// </summary>
+        public void BuildCanaryBroadcasts(List<byte[]> payloadsOut)
+        {
+            payloadsOut.Clear();
+
+            List<(byte Id, float X, float Y, float Z)> positions =
+                _trustPolicy?.SnapshotPlayerPositions();
+            if (positions == null || positions.Count == 0)
+            {
+                // Nobody online: retire the traps so a fresh join doesn't
+                // inherit a stale enemy list.
+                foreach ((int id, _) in _canaries)
+                {
+                    byte[] kill = BuildKillEnemyMessagePayload(id);
+                    if (kill != null)
+                        payloadsOut.Add(kill);
+                    _trustPolicy?.UnregisterCanaryEnemy(id);
+                }
+                _canaries.Clear();
+                return;
+            }
+
+            DateTime now = DateTime.UtcNow;
+            for (int i = _canaries.Count - 1; i >= 0; i--)
+            {
+                if (now - _canaries[i].PlantedUtc <= CanaryLifetime)
+                    continue;
+                byte[] kill = BuildKillEnemyMessagePayload(_canaries[i].Id);
+                if (kill != null)
+                    payloadsOut.Add(kill);
+                _trustPolicy?.UnregisterCanaryEnemy(_canaries[i].Id);
+                _canaries.RemoveAt(i);
+            }
+
+            while (_canaries.Count < MaxLiveCanaries)
+            {
+                (byte _, float px, float py, float pz) =
+                    positions[_dragonJitter.Next(positions.Count)];
+
+                // 40-60 m below the chosen player, offset horizontally so it
+                // lands in rock, not the cave they might be standing in.
+                float cx = px + 10f + (float)_dragonJitter.NextDouble() * 12f;
+                float cz = pz - 10f - (float)_dragonJitter.NextDouble() * 12f;
+                float cy = Math.Max(Math.Min(py, -20f) - 40f - (float)_dragonJitter.NextDouble() * 20f, -96f);
+
+                // Skeleton/archer family (26-49): no digging, dies to give-up.
+                byte type = (byte)(26 + _dragonJitter.Next(24));
+                int canaryId = 0x40000000 + (_canarySeq++ & 0x3FFF);
+
+                byte[] spawn = BuildSpawnEnemyMessagePayload(type, canaryId, cx, cy, cz);
+                if (spawn == null)
+                    break;
+
+                payloadsOut.Add(spawn);
+                _canaries.Add((canaryId, now));
+                _trustPolicy?.RegisterCanaryEnemy(canaryId, type);
+            }
+        }
+
+        /// <summary>
+        /// Builds vanilla SpawnEnemyMessage:
+        /// [msgId][SpawnPosition:vec3][SpawnerPosition:vec3][EnemyTypeID:byte]
+        /// [EnemyID:int][RandomSeed:int][SpawnValue:int][PlayerName:string]
+        /// [InitPackage:5 x int][checksum]
+        /// </summary>
+        private byte[] BuildSpawnEnemyMessagePayload(
+            byte enemyType, int enemyId, float x, float y, float z)
+        {
+            const string fullTypeName = "DNA.CastleMinerZ.Net.SpawnEnemyMessage";
+
+            if (!_typeToMessageId.TryGetValue(fullTypeName, out byte msgId))
+            {
+                _log("ServerWorld: SpawnEnemyMessage ID not found.");
+                return null;
+            }
+
+            using var ms = new MemoryStream();
+            using var writer = new BinaryWriter(ms);
+
+            writer.Write(msgId);
+            writer.Write(x); writer.Write(y); writer.Write(z);      // SpawnPosition
+            writer.Write(0f); writer.Write(0f); writer.Write(0f);    // SpawnerPosition = none
+            writer.Write(enemyType);
+            writer.Write(enemyId);
+            writer.Write(_dragonJitter.Next());                      // RandomSeed
+            writer.Write(0);                                         // SpawnValue
+            writer.Write("");                                        // PlayerName
+            // InitPackage: speeds stored as int = 1000 * value. Plausible
+            // skeleton-class values; exact numbers don't matter for a trap.
+            writer.Write(2000);   // SlowSpeed 2.0
+            writer.Write(4000);   // FastSpeed 4.0
+            writer.Write(1000);   // EmergeSpeed 1.0
+            writer.Write(0);      // RunActivationTime
+            writer.Write(45000);  // NormalActivationTime 45.0
+
+            writer.Flush();
+
+            int len = (int)ms.Position;
+            writer.Write(XorChecksum(ms.GetBuffer(), 0, len));
+            writer.Flush();
+
+            return ms.ToArray();
+        }
+
+        /// <summary>
+        /// Builds vanilla KillEnemyMessage used to retire a canary:
+        /// [msgId][EnemyID:int][TargetID:int][WeaponID:short][KillerID:byte][checksum]
+        /// </summary>
+        private byte[] BuildKillEnemyMessagePayload(int enemyId)
+        {
+            const string fullTypeName = "DNA.CastleMinerZ.Net.KillEnemyMessage";
+
+            if (!_typeToMessageId.TryGetValue(fullTypeName, out byte msgId))
+            {
+                _log("ServerWorld: KillEnemyMessage ID not found.");
+                return null;
+            }
+
+            using var ms = new MemoryStream();
+            using var writer = new BinaryWriter(ms);
+
+            writer.Write(msgId);
+            writer.Write(enemyId);
+            writer.Write(0);        // TargetID
+            writer.Write((short)0); // WeaponID
+            writer.Write((byte)0);  // KillerID = host
+
+            writer.Flush();
+
+            int len = (int)ms.Position;
+            writer.Write(XorChecksum(ms.GetBuffer(), 0, len));
+            writer.Flush();
+
+            return ms.ToArray();
+        }
+
         /// <summary>
         /// Broadcasts a server-originated channel-0 payload to all live connections.
         /// sendToClient wraps this as sender id 0 in both Steam and Lidgren server hosts.
@@ -3381,6 +4416,326 @@ namespace CMZDedicatedSteamServer
         private static bool IsValidDragonType(byte dragonType)
         {
             return dragonType <= 4;
+        }
+
+        /// <summary>
+        /// Vanilla per-type spawn waits from EnemyManager.RecalculateDragonBox:
+        /// FIRE 32, FOREST 48, LIZARD 64, ICE 80, SKELETON 80 minutes, plus a
+        /// jitter of ±4 minutes (vanilla uses 16 min * ±0.25).
+        /// </summary>
+        private static double DragonWaitMinutes(int dragonType)
+        {
+            double baseWait = dragonType switch
+            {
+                0 => 32.0,
+                1 => 48.0,
+                2 => 64.0,
+                _ => 80.0,
+            };
+            return baseWait + 16.0 * (_dragonJitter.NextDouble() * 0.5 - 0.25);
+        }
+
+        private static readonly Random _dragonJitter = new Random();
+
+        /// <summary>
+        /// Server-driven dragon spawning, mirroring vanilla EnemyManager exactly:
+        ///
+        /// - Distance dragons (forBiome): each player's horizontal distance from
+        ///   origin is checked against DragonDistanceThresholds (100/500/1000/
+        ///   2600/4000). The index is monotonic during a session and rewound on
+        ///   join, like vanilla's ResetFarthestDistance. In vanilla only the
+        ///   host's own distance drove this — the dedicated host has no avatar,
+        ///   so every connected player's distance drives it and the trigger
+        ///   player becomes the controller (SpawnerID), like a client request.
+        ///
+        /// - Timed dragons (CheckDragonBox): each player owns a ±500 X/Z box
+        ///   around their position. Leaving it resets progression to FIRE and
+        ///   re-arms the wait; inside, FIRE 32 / FOREST 48 / LIZARD 64 /
+        ///   ICE+SKELETON 80 min (+/-4 min jitter) elapse before each request.
+        ///   A denied request retries every minute, like vanilla's
+        ///   NextSpawnDragonTime += 1min.
+        ///
+        /// - Any request beyond 3600 units from origin becomes SKELETON.
+        ///
+        /// - DragonEndurance ignores all of this: waves every 10-30 s after a
+        ///   removal, cycling types, health 25 + 100/spawn - 15/kill.
+        /// </summary>
+        /// <returns>True and a SpawnDragonMessage payload when a spawn is due.</returns>
+        public bool TryGetScheduledDragonSpawn(out byte[] payload, out byte controllerId, out byte dragonType)
+        {
+            payload = null;
+            controllerId = 0;
+            dragonType = 0;
+
+            List<(byte Id, float X, float Y, float Z)> positions = _trustPolicy?.SnapshotPlayerPositions();
+            if (positions == null || positions.Count == 0)
+                return false;
+
+            DateTime now = DateTime.UtcNow;
+            lock (_dragonStateLock)
+            {
+                if (_dragonActive)
+                    return false;
+
+                // Drop schedule state for players who left.
+                if (_dragonSchedules.Count > 0)
+                {
+                    List<byte> stale = null;
+                    foreach (byte id in _dragonSchedules.Keys)
+                    {
+                        bool live = false;
+                        foreach ((byte pid, _, _, _) in positions)
+                        {
+                            if (pid == id) { live = true; break; }
+                        }
+                        if (!live)
+                            (stale ??= []).Add(id);
+                    }
+                    if (stale != null)
+                        foreach (byte id in stale)
+                            _dragonSchedules.Remove(id);
+                }
+
+                if (_gameMode == DragonEnduranceGameMode)
+                    return TrySpawnEnduranceDragon(now, positions, out payload, out controllerId, out dragonType);
+
+                if (now < _nextDragonAllowedUtc)
+                    return false;
+
+                foreach ((byte id, float x, float y, float z) in positions)
+                {
+                    PlayerDragonSchedule st = GetOrInitDragonSchedule(id, x, z, now);
+                    float distSq = x * x + z * z;
+
+                    // Vanilla TeleportToLocation -> ResetFarthestDistance: a
+                    // discontinuous jump (>200 in one snapshot window — flight
+                    // can't do that) rewinds the distance index to the landing
+                    // point instead of consuming skipped thresholds.
+                    if (st.HasLast &&
+                        (Math.Abs(x - st.LastX) > 200f || Math.Abs(z - st.LastZ) > 200f))
+                    {
+                        float dNew = (float)Math.Sqrt(distSq);
+                        while (st.DistanceIndex > 0 &&
+                               dNew <= DragonDistanceThresholds[st.DistanceIndex - 1])
+                        {
+                            st.DistanceIndex--;
+                        }
+                    }
+                    st.LastX = x;
+                    st.LastZ = z;
+                    st.HasLast = true;
+
+                    // Distance trigger first — vanilla checks dragonDistances
+                    // before CheckDragonBox in the same update.
+                    if (st.DistanceIndex < DragonDistanceThresholds.Length &&
+                        distSq > DragonDistanceThresholds[st.DistanceIndex] * DragonDistanceThresholds[st.DistanceIndex])
+                    {
+                        byte type = distSq > 12960000f ? (byte)4 : (byte)st.DistanceIndex;
+                        st.DistanceIndex++; // spent even when the spawn is denied, like vanilla
+                        if (TrySpawnDragonFor(id, type, true, -1f, now,
+                                $"distance {Math.Sqrt(distSq):F0}m from origin",
+                                out payload, out controllerId, out dragonType))
+                        {
+                            // Vanilla RecalculateDragonBox runs on EVERY
+                            // SpawnDragonMessage: recenter + re-arm the timed
+                            // wait (progression itself only advances on
+                            // !forBiome spawns).
+                            st.BoxX = x;
+                            st.BoxZ = z;
+                            st.NextTimedUtc = now.AddMinutes(DragonWaitMinutes(st.NextTimedType));
+                            return true;
+                        }
+                    }
+
+                    // Timed dragon box: vanilla's BoundingBox is ±500 X/Z with
+                    // FIXED world Y bounds -100..100 — leaving any of them is
+                    // Disjoint and resets progression to FIRE.
+                    if (y < -100f || y > 100f || Math.Abs(x - st.BoxX) > 500f || Math.Abs(z - st.BoxZ) > 500f)
+                    {
+                        st.NextTimedType = 0;
+                        st.BoxX = x;
+                        st.BoxZ = z;
+                        st.NextTimedUtc = now.AddMinutes(DragonWaitMinutes(0));
+                        continue;
+                    }
+
+                    if (now < st.NextTimedUtc)
+                        continue;
+
+                    if (st.NextTimedType >= 5)
+                    {
+                        // COUNT never spawns; vanilla keeps asking each minute.
+                        st.NextTimedUtc = now.AddMinutes(1.0);
+                        continue;
+                    }
+
+                    byte timedType = distSq > 12960000f ? (byte)4 : (byte)st.NextTimedType;
+                    if (TrySpawnDragonFor(id, timedType, false, -1f, now,
+                            $"timed wait done ({GetDragonTypeName(timedType)})",
+                            out payload, out controllerId, out dragonType))
+                    {
+                        // Vanilla SetCurrentTimedDragonType advances past the
+                        // SPAWNED type — a >3600 skeleton override ends the
+                        // progression (next = COUNT).
+                        st.NextTimedType = Math.Min(timedType + 1, 5);
+                        st.BoxX = x;
+                        st.BoxZ = z;
+                        st.NextTimedUtc = now.AddMinutes(DragonWaitMinutes(st.NextTimedType));
+                        return true;
+                    }
+
+                    // Denied by the shared gate — vanilla retries every minute.
+                    st.NextTimedUtc = now.AddMinutes(1.0);
+                }
+
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// DragonEndurance wave spawn — vanilla's else-branch: no distance/timed
+        /// logic, just the next type in the cycle on the wave timer.
+        /// </summary>
+        private bool TrySpawnEnduranceDragon(
+            DateTime now,
+            List<(byte Id, float X, float Y, float Z)> positions,
+            out byte[] payload, out byte controllerId, out byte dragonType)
+        {
+            payload = null;
+            controllerId = 0;
+            dragonType = 0;
+
+            if (now < _nextEnduranceDragonUtc)
+                return false;
+
+            byte type = (byte)_enduranceNextDragonType;
+            float health = _enduranceDragonHealth;
+            _enduranceNextDragonType = (_enduranceNextDragonType + 1) % 5;
+            _enduranceDragonHealth += 100f;
+
+            return TrySpawnDragonFor(
+                positions[0].Id, type, false, health, now,
+                $"endurance wave (health {health:F0})",
+                out payload, out controllerId, out dragonType);
+        }
+
+        /// <summary>
+        /// Commits a dragon spawn under the shared vanilla gates (one active
+        /// dragon, post-removal cooldown) and builds the broadcast payload.
+        /// Caller holds _dragonStateLock.
+        /// </summary>
+        private bool TrySpawnDragonFor(
+            byte controller, byte type, bool forBiome, float health, DateTime now,
+            string trigger,
+            out byte[] payload, out byte controllerId, out byte dragonType)
+        {
+            payload = null;
+            controllerId = 0;
+            dragonType = 0;
+
+            if (_dragonActive || now < _nextDragonAllowedUtc || !IsValidDragonType(type))
+                return false;
+
+            _dragonActive = true;
+            _dragonControllerId = controller;
+            _activeDragonType = type;
+            _activeDragonForBiome = forBiome;
+            _activeDragonHealth = health;
+
+            payload = BuildSpawnDragonMessagePayload(controller, type, forBiome, health);
+            if (payload == null)
+            {
+                _dragonActive = false;
+                return false;
+            }
+
+            _log(
+                $"[Dragon] Spawned {GetDragonTypeName(type)} dragon ({trigger}). " +
+                $"Controller={controller}, ForBiome={forBiome}, Health={health}.");
+
+            controllerId = controller;
+            dragonType = type;
+            return true;
+        }
+
+        /// <summary>
+        /// Returns the per-player schedule, creating it on first sight with the
+        /// vanilla join semantics: box centered on the player, timed wait armed
+        /// for FIRE, distance index rewound past thresholds already crossed.
+        /// </summary>
+        private PlayerDragonSchedule GetOrInitDragonSchedule(byte id, float x, float z, DateTime now)
+        {
+            if (_dragonSchedules.TryGetValue(id, out PlayerDragonSchedule st))
+                return st;
+
+            st = new PlayerDragonSchedule
+            {
+                BoxX = x,
+                BoxZ = z,
+                NextTimedType = 0,
+                NextTimedUtc = now.AddMinutes(DragonWaitMinutes(0)),
+                LastX = x,
+                LastZ = z,
+                HasLast = true
+            };
+
+            float d = (float)Math.Sqrt(x * x + z * z);
+            while (st.DistanceIndex < DragonDistanceThresholds.Length &&
+                   d > DragonDistanceThresholds[st.DistanceIndex])
+            {
+                st.DistanceIndex++;
+            }
+
+            _dragonSchedules[id] = st;
+            return st;
+        }
+
+        /// <summary>
+        /// Builds vanilla RemoveDragonMessage: [msgId][checksum] (no fields).
+        /// </summary>
+        private byte[] BuildRemoveDragonMessagePayload()
+        {
+            const string fullTypeName = "DNA.CastleMinerZ.Net.RemoveDragonMessage";
+
+            if (!_typeToMessageId.TryGetValue(fullTypeName, out byte msgId))
+            {
+                _log("ServerWorld: RemoveDragonMessage ID not found.");
+                return null;
+            }
+
+            using var ms = new MemoryStream();
+            using var writer = new BinaryWriter(ms);
+
+            writer.Write(msgId);
+            writer.Flush();
+
+            int len = (int)ms.Position;
+            writer.Write(XorChecksum(ms.GetBuffer(), 0, len));
+            writer.Flush();
+
+            return ms.ToArray();
+        }
+
+        /// <summary>
+        /// Drains the pending controller-disconnect dragon removal. The server
+        /// tick calls this before the scheduled-spawn check so the orphan
+        /// cleanup goes out before any replacement spawn.
+        /// </summary>
+        public bool TryConsumeDragonRemoveBroadcast(out byte[] payload)
+        {
+            lock (_dragonStateLock)
+            {
+                if (!_pendingDragonRemoveBroadcast)
+                {
+                    payload = null;
+                    return false;
+                }
+
+                payload = BuildRemoveDragonMessagePayload();
+                if (payload != null)
+                    _pendingDragonRemoveBroadcast = false;
+                return payload != null;
+            }
         }
 
         /// <summary>
@@ -3651,14 +5006,22 @@ namespace CMZDedicatedSteamServer
         }
 
         /// <summary>
-        /// Active pickup records keyed by pickup id.
+        /// Active pickup records keyed by (spawnerId, pickupId).
         ///
         /// Notes:
-        /// - CreatePickupMessage does not carry SpawnerID, so the host tracks by PickupID.
-        /// - When RequestPickupMessage arrives, the host consumes the cached entry and broadcasts
-        ///   a ConsumePickupMessage back out to all clients.
+        /// - CreatePickupMessage does not carry SpawnerID on the wire, but vanilla
+        ///   sets it to the creating gamer's id - our senderId is that id.
+        /// - PickupID counters are per-client, so two players can legitimately
+        ///   produce the same PickupID; the composite key mirrors the vanilla
+        ///   lookup in PickupManager.HandleRequestPickupMessage.
         /// </summary>
-        private readonly Dictionary<int, PendingPickup> _pendingPickupsById = [];
+        private readonly Dictionary<long, PendingPickup> _pendingPickupsById = [];
+
+        /// <summary>Composite key for a pending pickup: creator id + creator-local pickup id.</summary>
+        private static long PendingPickupKey(int spawnerId, int pickupId)
+        {
+            return ((long)spawnerId << 32) | (pickupId & 0xFFFFFFFFL);
+        }
 
         #endregion
 
@@ -4186,6 +5549,7 @@ namespace CMZDedicatedSteamServer
                 TypeName = typeName,
                 SenderId = senderId,
                 SenderName = senderName,
+                RemoteId = TryConvertSenderConnectionToRemoteId(senderConn),
                 Payload = data,
 
                 DeserializeGameMessage = DeserializeGameMessage,
@@ -4242,6 +5606,25 @@ namespace CMZDedicatedSteamServer
             }
 
             return "Player" + senderId;
+        }
+
+        /// <summary>
+        /// Converts the transport sender object into a stable remote id when available.
+        /// Steam passes the sender SteamID64 as the sender connection object.
+        /// </summary>
+        private static ulong TryConvertSenderConnectionToRemoteId(object senderConn)
+        {
+            if (senderConn == null)
+                return 0UL;
+
+            try
+            {
+                return Convert.ToUInt64(senderConn, CultureInfo.InvariantCulture);
+            }
+            catch
+            {
+                return 0UL;
+            }
         }
 
         /// <summary>

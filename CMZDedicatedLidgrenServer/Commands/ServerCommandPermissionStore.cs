@@ -41,6 +41,17 @@ namespace CMZDedicatedLidgrenServer.Commands
         /// </summary>
         public string Prefix { get; private set; } = "!";
 
+        private readonly List<string> _prefixes = ["!"];
+
+        /// <summary>
+        /// All accepted chat prefixes used for server commands.
+        /// Examples: !help, /help
+        /// </summary>
+        public IReadOnlyList<string> Prefixes
+        {
+            get { return _prefixes; }
+        }
+
         /// <summary>
         /// Maximum number of chat lines used by one help page.
         /// </summary>
@@ -115,14 +126,15 @@ namespace CMZDedicatedLidgrenServer.Commands
 
         /// <summary>
         /// Resolves the sender's rank using the most stable available identity.
+        /// Players with no stored entry are Members - nobody is "unranked".
         /// </summary>
         public ServerCommandRank GetPlayerRank(ServerCommandContext context)
         {
             if (context == null)
-                return ServerCommandRank.Default;
+                return ServerCommandRank.Member;
 
             if (context.RankOverride.HasValue)
-                return context.RankOverride.Value;
+                return ServerCommandRankHelper.ClampRank(context.RankOverride.Value);
 
             string primaryKey = NormalizeIdentityKey(context.RemoteKey);
             if (!string.IsNullOrWhiteSpace(primaryKey) &&
@@ -159,7 +171,35 @@ namespace CMZDedicatedLidgrenServer.Commands
                     return nameRank;
             }
 
-            return ServerCommandRank.Default;
+            return ServerCommandRank.Member;
+        }
+
+        /// <summary>
+        /// Ensures a connecting player has an explicit Member rank on record so every
+        /// player "has a rank" instead of being unranked. Does nothing when any known
+        /// identity key (steam/name) already holds a stored rank for this player.
+        /// </summary>
+        public void EnsureMemberRankAssigned(ulong remoteId, string playerName)
+        {
+            string steamKey = remoteId != 0UL ? "steam:" + remoteId : null;
+            string nameKey = !string.IsNullOrWhiteSpace(playerName)
+                ? "name:" + playerName.Trim()
+                : null;
+
+            if (!string.IsNullOrWhiteSpace(steamKey) &&
+                _playerRanks.ContainsKey(steamKey))
+                return;
+
+            if (!string.IsNullOrWhiteSpace(nameKey) &&
+                _playerRanks.ContainsKey(nameKey))
+                return;
+
+            string writeKey = steamKey ?? nameKey;
+            if (string.IsNullOrWhiteSpace(writeKey))
+                return;
+
+            _playerRanks[writeKey] = ServerCommandRank.Member;
+            SaveRanks();
         }
 
         /// <summary>
@@ -172,7 +212,7 @@ namespace CMZDedicatedLidgrenServer.Commands
             if (string.IsNullOrWhiteSpace(identityKey))
                 return;
 
-            _playerRanks[identityKey] = rank;
+            _playerRanks[identityKey] = ServerCommandRankHelper.ClampRank(rank);
             SaveRanks();
         }
 
@@ -250,16 +290,18 @@ namespace CMZDedicatedLidgrenServer.Commands
             StringBuilder sb = new();
 
             sb.AppendLine("# Server command settings and required ranks.");
-            sb.AppendLine("# Rank order: Default < Member < Moderator < Admin");
-            sb.AppendLine("# Note: \"Defualt\" is accepted as a typo-compatible alias, but this file writes \"Default\".");
+            sb.AppendLine("# Rank order: Visitor < Member < Moderator < Admin");
+            sb.AppendLine("# Every player joins as Member; Visitor is a restricted demotion rank.");
             sb.AppendLine();
             sb.AppendLine("[Settings]");
             sb.AppendLine("Enabled=true");
             sb.AppendLine("Prefix=!");
+            sb.AppendLine("Prefixes=!,/");
             sb.AppendLine("HelpMaxLines=5");
             sb.AppendLine();
             sb.AppendLine("[Commands]");
-            sb.AppendLine("help=Default");
+            sb.AppendLine("help=Visitor");
+            sb.AppendLine("status=Visitor");
             sb.AppendLine("players=Moderator");
             sb.AppendLine("kick=Moderator");
             sb.AppendLine("ban=Admin");
@@ -298,6 +340,7 @@ namespace CMZDedicatedLidgrenServer.Commands
 
             Enabled = true;
             Prefix = "!";
+            SetPrefixesFromConfig("!");
             HelpMaxLines = 5;
 
             string section = string.Empty;
@@ -331,7 +374,11 @@ namespace CMZDedicatedLidgrenServer.Commands
                     }
                     else if (key.Equals("Prefix", StringComparison.OrdinalIgnoreCase))
                     {
-                        Prefix = string.IsNullOrEmpty(value) ? "!" : value;
+                        SetPrefixesFromConfig(string.IsNullOrEmpty(value) ? "!" : value);
+                    }
+                    else if (key.Equals("Prefixes", StringComparison.OrdinalIgnoreCase))
+                    {
+                        SetPrefixesFromConfig(string.IsNullOrEmpty(value) ? "!" : value);
                     }
                     else if (key.Equals("HelpMaxLines", StringComparison.OrdinalIgnoreCase))
                     {
@@ -341,7 +388,7 @@ namespace CMZDedicatedLidgrenServer.Commands
                 }
                 else if (section.Equals("Commands", StringComparison.OrdinalIgnoreCase))
                 {
-                    if (ServerCommandRankHelper.TryParse(value, out ServerCommandRank rank))
+                    if (ServerCommandRankHelper.TryParseStrict(value, out ServerCommandRank rank))
                     {
                         string normalized = ServerCommandParser.NormalizeCommandName(key);
                         if (!string.IsNullOrWhiteSpace(normalized))
@@ -349,6 +396,36 @@ namespace CMZDedicatedLidgrenServer.Commands
                     }
                 }
             }
+        }
+
+        /// <summary>
+        /// Parses a comma-separated prefix list from config.
+        /// Example: Prefixes=!,/
+        /// </summary>
+        private void SetPrefixesFromConfig(string value)
+        {
+            _prefixes.Clear();
+
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                string[] parts = value.Split(',');
+
+                foreach (string rawPart in parts)
+                {
+                    string prefix = rawPart.Trim();
+
+                    if (string.IsNullOrEmpty(prefix))
+                        continue;
+
+                    if (!_prefixes.Contains(prefix))
+                        _prefixes.Add(prefix);
+                }
+            }
+
+            if (_prefixes.Count == 0)
+                _prefixes.Add("!");
+
+            Prefix = _prefixes[0];
         }
 
         private void LoadRanks()
@@ -394,11 +471,12 @@ namespace CMZDedicatedLidgrenServer.Commands
             StringBuilder sb = new();
 
             sb.AppendLine("# Server command settings and required ranks.");
-            sb.AppendLine("# Rank order: Default < Member < Moderator < Admin");
+            sb.AppendLine("# Rank order: Visitor < Member < Moderator < Admin");
             sb.AppendLine();
             sb.AppendLine("[Settings]");
             sb.AppendLine("Enabled=" + (Enabled ? "true" : "false"));
             sb.AppendLine("Prefix=" + Prefix);
+            sb.AppendLine("Prefixes=" + string.Join(",", _prefixes));
             sb.AppendLine("HelpMaxLines=" + HelpMaxLines);
             sb.AppendLine();
             sb.AppendLine("[Commands]");
@@ -429,18 +507,28 @@ namespace CMZDedicatedLidgrenServer.Commands
 
         /// <summary>
         /// Returns the saved rank for a specific identity key, such as steam:..., name:..., or ip:...
+        /// Identities with no stored rank are Members.
         /// </summary>
         public ServerCommandRank GetRankForIdentityKey(string identityKey)
         {
+            return TryGetRankForIdentityKey(identityKey, out ServerCommandRank rank)
+                ? ServerCommandRankHelper.ClampRank(rank)
+                : ServerCommandRank.Member;
+        }
+
+        /// <summary>
+        /// Returns true when the identity key has a stored rank entry.
+        /// </summary>
+        public bool TryGetRankForIdentityKey(string identityKey, out ServerCommandRank rank)
+        {
+            rank = ServerCommandRank.Member;
+
             string normalizedKey = NormalizeIdentityKey(identityKey);
 
             if (string.IsNullOrWhiteSpace(normalizedKey))
-                return ServerCommandRank.Default;
+                return false;
 
-            if (_playerRanks.TryGetValue(normalizedKey, out ServerCommandRank rank))
-                return rank;
-
-            return ServerCommandRank.Default;
+            return _playerRanks.TryGetValue(normalizedKey, out rank);
         }
 
         private static bool ParseBool(string value, bool fallback)
