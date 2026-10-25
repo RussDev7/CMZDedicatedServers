@@ -21,6 +21,7 @@ using System.Collections;
 using System.Reflection;
 using System.Linq;
 using System.IO;
+using System.Text;
 using System;
 
 namespace CMZDedicatedSteamServer.Hosting
@@ -161,6 +162,17 @@ namespace CMZDedicatedSteamServer.Hosting
         /// Handles in-game chat commands such as !help, !kick, !ban, !reload, and !op.
         /// </summary>
         private ServerCommandManager _commands;
+
+        /// <summary>
+        /// Trust/enforcement policy backing the playerinfo inspection surface.
+        /// Null when TrustEnforcement is disabled in server.properties.
+        /// </summary>
+        private Trust.ServerPolicy _trustPolicy;
+
+        /// <summary>
+        /// Per-peer packet counters (gap, max size, count) for playerinfo.
+        /// </summary>
+        private readonly PeerTrafficMonitor _traffic = new PeerTrafficMonitor();
 
         /// <summary>
         /// Cached message id for DNA.CastleMinerZ.Net.BroadcastTextMessage.
@@ -305,7 +317,8 @@ namespace CMZDedicatedSteamServer.Hosting
                 Reload,
                 ReloadPlugins,
                 RequestRestart,
-                ResolveCommandTarget);
+                ResolveCommandTarget,
+                GetPlayerInfoText);
             _lobbyHost = new SteamLobbyHost(
                 _config,
                 _assemblyLoader.CommonAssembly,
@@ -383,6 +396,8 @@ namespace CMZDedicatedSteamServer.Hosting
                     // them — they never auto-reset, only a manual wipe clears.
                     var kickStore = new ServerKickStore(_baseDir, _log);
                     trustPolicy.SetKickCountStore(kickStore.Load, kickStore.Save);
+                    trustPolicy.SetSpawnUnburyHandler(UnburySpawnedPlayer);
+                    _trustPolicy = trustPolicy;
                     _log("[Trust] Server-authoritative enforcement enabled (gameMode=" +
                          _config.GameMode + ", difficulty=" + _config.Difficulty + ").");
                 }
@@ -647,6 +662,14 @@ namespace CMZDedicatedSteamServer.Hosting
             string messageTypeName = messageType.ToString();
             ulong senderSteamId = Convert.ToUInt64(ReflectEx.GetRequiredMemberValue(packet, "SenderId"));
 
+            int packetBytes = 0;
+            if (messageTypeName == "Data")
+            {
+                try { packetBytes = (int)(Convert.ToInt64(ReflectEx.GetRequiredMemberValue(packet, "LengthBits")) / 8); }
+                catch { }
+            }
+            _traffic.Record(senderSteamId, packetBytes);
+
             if (messageTypeName == "Data" && _forceDroppedSteamIds.Contains(senderSteamId))
             {
                 // The peer was already removed from the authoritative server state.
@@ -755,6 +778,7 @@ namespace CMZDedicatedSteamServer.Hosting
                     {
                         _approval.RemovePeer(senderSteamId);
                         _connectionToGamer.Remove(senderSteamId);
+                        _traffic.Remove(senderSteamId);
                         _playerExistsPayloadById.Remove(peer.Gid);
 
                         _worldHandler?.OnClientDisconnected(peer.Gid);
@@ -1628,6 +1652,22 @@ namespace CMZDedicatedSteamServer.Hosting
                 return "No peer registry is available yet.";
 
             IReadOnlyList<ConnectedSteamPeer> peers = _peers.GetConnectedPeersSnapshot();
+
+            // Machine snapshot for the desktop GUI's Players tab. The GUI polls
+            // `players` and reconciles its cards against this authoritative
+            // list so log-parsing drift can never strand placeholder cards.
+            if (Console.IsOutputRedirected)
+            {
+                var sb = new StringBuilder("@@PLAYERS");
+                foreach (ConnectedSteamPeer peer in peers)
+                {
+                    string safeName = (peer.Gamertag ?? "?")
+                        .Replace('|', ' ').Replace(';', ' ').Replace('\n', ' ').Replace('\r', ' ');
+                    sb.Append(' ').Append(peer.Gid).Append('|').Append(safeName).Append('|').Append(peer.SteamId).Append(';');
+                }
+                try { Console.Out.WriteLine(sb.ToString()); Console.Out.Flush(); } catch { }
+            }
+
             if (peers.Count == 0)
                 return "No players connected.";
 
@@ -1637,6 +1677,80 @@ namespace CMZDedicatedSteamServer.Hosting
                 text += Environment.NewLine + $"  {peer.Gid}: {peer.Gamertag} ({peer.SteamId})";
 
             return text;
+        }
+
+        /// <summary>
+        /// Inspection dump for the `playerinfo` console command. Returns the
+        /// human-readable block; when stdout is redirected (desktop GUI child)
+        /// the same data also goes out as a @@PINFO machine line the GUI feeds
+        /// its player cards. All values are server-owned trust state.
+        /// </summary>
+        public string GetPlayerInfoText(string target)
+        {
+            if (!TryResolveSteamPeer(target, out ConnectedSteamPeer peer))
+                return "Player info failed. Could not find player: " + target;
+
+            Trust.PlayerTrustSnapshot snapshot;
+            if (_trustPolicy == null ||
+                !_trustPolicy.TrySnapshotPlayer(peer.Gid, out snapshot))
+            {
+                // No trust state yet (still connecting, or enforcement off) -
+                // still surface the peer + traffic data.
+                snapshot = new Trust.PlayerTrustSnapshot
+                {
+                    Gid = peer.Gid,
+                    SteamId = peer.SteamId,
+                    Name = peer.Gamertag ?? "?",
+                };
+            }
+
+            if (_traffic.TryGet(peer.SteamId, out double lastGap, out double avgGap,
+                out int maxBytes, out long count, out double idleMs))
+            {
+                snapshot.HasTraffic = true;
+                snapshot.LastGapMs = lastGap;
+                snapshot.AvgGapMs = avgGap;
+                snapshot.IdleMs = idleMs;
+                snapshot.MaxPacketBytes = maxBytes;
+                snapshot.PacketCount = count;
+            }
+
+            if (Console.IsOutputRedirected)
+            {
+                try
+                {
+                    Console.Out.WriteLine(Trust.PlayerInspection.FormatMachine(snapshot));
+                    Console.Out.Flush();
+                }
+                catch { }
+            }
+
+            return Trust.PlayerInspection.FormatDisplay(snapshot);
+        }
+
+        /// <summary>
+        /// Frees a joiner/respawner whose baseline position landed inside solid
+        /// terrain: carves the body column into the saved delta and broadcasts
+        /// the AlterBlocks to every client as that player's edit so the pocket
+        /// renders for everyone — including the buried client itself.
+        /// </summary>
+        private void UnburySpawnedPlayer(ulong steamId, int x, int y, int z)
+        {
+            if (_worldHandler == null || _peers == null)
+                return;
+            if (!_peers.TryGetConnectedPeer(steamId, out ConnectedSteamPeer buried))
+                return;
+
+            List<byte[]> payloads = _worldHandler.CarveSpawnPocket(x, y, z);
+            if (payloads == null || payloads.Count == 0)
+                return;
+
+            object delivery = GetReliableOrderedDeliveryMethod();
+            foreach (ConnectedSteamPeer target in _peers.GetConnectedPeersSnapshot())
+            {
+                foreach (byte[] payload in payloads)
+                    SendChannel0PayloadToSteam(target.SteamId, target.Gid, buried.Gid, payload, delivery);
+            }
         }
 
         /// <summary>

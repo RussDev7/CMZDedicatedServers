@@ -11,6 +11,8 @@ using System.Collections.Concurrent;
 using System.Linq;
 using System.IO;
 using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 
@@ -100,6 +102,101 @@ namespace CMZDedicatedSteamServer
         [System.Runtime.InteropServices.DllImport("winmm.dll")]
         private static extern uint timeEndPeriod(uint uPeriod);
 
+        // ---- GUI <-> terminal switching (no server restart) ----
+
+        [DllImport("kernel32.dll")]
+        private static extern bool AllocConsole();
+
+        [DllImport("kernel32.dll")]
+        private static extern bool FreeConsole();
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetStdHandle(int nStdHandle);
+
+        [DllImport("kernel32.dll")]
+        private static extern bool SetStdHandle(int nStdHandle, IntPtr handle);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern IntPtr CreateFile(string name, uint access, uint share, IntPtr sa, uint mode, uint flags, IntPtr templ);
+
+        private const int STD_INPUT_HANDLE = -10;
+        private const int STD_OUTPUT_HANDLE = -11;
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetConsoleWindow();
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetSystemMenu(IntPtr hWnd, bool bRevert);
+
+        [DllImport("user32.dll")]
+        private static extern bool EnableMenuItem(IntPtr hMenu, uint id, uint flags);
+
+        private const uint SC_CLOSE = 0xF060;
+        private const uint MF_BYCOMMAND = 0x0;
+        private const uint MF_GRAYED = 0x1;
+        private const uint GENERIC_READ = 0x80000000;
+        private const uint GENERIC_WRITE = 0x40000000;
+        private const uint FILE_SHARE_READ = 0x1;
+        private const uint FILE_SHARE_WRITE = 0x2;
+        private const uint OPEN_EXISTING = 3;
+
+        private static bool _terminalMode;
+        private static TextWriter _pipeOut;
+        private static IntPtr _pipeOutHandle;
+        private static IntPtr _pipeInHandle;
+        private static SteamDedicatedServer _activeServer;
+        private static Action<string> _activeLog;
+        private static StreamWriter _conWriter;
+        private static StreamReader _conReader;
+
+        // Rolling history so a freshly attached terminal shows what the GUI saw.
+        private static readonly ConcurrentQueue<string> _recentLogLines = new ConcurrentQueue<string>();
+        private const int RecentLogLinesMax = 400;
+
+        // Writes every line to the GUI pipe AND (except @@ control lines) the real console.
+        private sealed class TeeTextWriter : TextWriter
+        {
+            private readonly TextWriter _pipe;
+            private readonly TextWriter _console;
+
+            public TeeTextWriter(TextWriter pipe, TextWriter console) { _pipe = pipe; _console = console; }
+
+            public override Encoding Encoding => _pipe.Encoding;
+
+            public override void Write(string value)
+            {
+                try { _pipe.Write(value); } catch { }
+                if (!IsInternalLine(value))
+                {
+                    try { _console.Write(value); } catch { }
+                }
+            }
+
+            public override void WriteLine(string value)
+            {
+                try { _pipe.WriteLine(value); } catch { }
+                if (!IsInternalLine(value))
+                {
+                    try { _console.WriteLine(value); } catch { }
+                }
+            }
+
+            public override void WriteLine()
+            {
+                try { _pipe.WriteLine(); } catch { }
+                try { _console.WriteLine(); } catch { }
+            }
+
+            public override void Flush()
+            {
+                try { _pipe.Flush(); } catch { }
+                try { _console.Flush(); } catch { }
+            }
+
+            private static bool IsInternalLine(string v) =>
+                v != null && v.StartsWith("@@", StringComparison.Ordinal);
+        }
+
         private static int RunConsoleHost()
         {
             // Windows sleeps in ~15.6 ms slices by default, so Thread.Sleep(16)
@@ -115,6 +212,10 @@ namespace CMZDedicatedSteamServer
             {
                 // No attached console handle (e.g., launched by GUI with redirected streams).
             }
+
+            _pipeOut = Console.Out;
+            _pipeOutHandle = GetStdHandle(STD_OUTPUT_HANDLE);
+            _pipeInHandle = GetStdHandle(STD_INPUT_HANDLE);
 
             try
             {
@@ -224,9 +325,23 @@ namespace CMZDedicatedSteamServer
                 {
                     using var server = new SteamDedicatedServer(baseDir, config, Log);
 
+                    _activeServer = server;
+                    _activeLog = Log;
+
                     Console.CancelKeyPress += (_, e) =>
                     {
                         e.Cancel = true;
+                        // Handlers stack per restart — only the live server instance acts.
+                        if (!ReferenceEquals(server, _activeServer))
+                            return;
+
+                        // CTRL_CLOSE_EVENT (2) has no named enum member on net481.
+                        if ((int)e.SpecialKey == 2 && _terminalMode)
+                        {
+                            ExitTerminalMode();
+                            return;
+                        }
+
                         Log("Ctrl+C received. Shutting down...");
                         server.Stop();
                     };
@@ -314,6 +429,25 @@ namespace CMZDedicatedSteamServer
                     if (line == null)
                         break;
 
+                    if (line.Equals("@@TERMINAL", StringComparison.OrdinalIgnoreCase))
+                    {
+                        EnterTerminalMode();
+                        continue;
+                    }
+
+                    // Silent GUI polls: emit the machine lines without logging
+                    // the human-readable blocks into the console stream.
+                    if (line.Equals("@@PLAYERS", StringComparison.OrdinalIgnoreCase))
+                    {
+                        server.GetPlayerListText();
+                        continue;
+                    }
+                    if (line.StartsWith("@@PINFO ", StringComparison.OrdinalIgnoreCase))
+                    {
+                        server.GetPlayerInfoText(line.Substring(8));
+                        continue;
+                    }
+
                     HandleConsoleCommand(server, line, log);
                 }
             })
@@ -324,6 +458,128 @@ namespace CMZDedicatedSteamServer
             thread.Start();
 
             return thread;
+        }
+
+        /// <summary>
+        /// Attaches a real console window to this process. Server keeps running —
+        /// output tees to the GUI pipe AND the console; commands type into the console.
+        /// Closing the console window (X) returns to the GUI.
+        /// </summary>
+        private static void EnterTerminalMode()
+        {
+            if (_terminalMode)
+                return;
+
+            if (!AllocConsole())
+            {
+                try { _pipeOut?.WriteLine("[GUI] Could not open a terminal window."); } catch { }
+                return;
+            }
+
+            _terminalMode = true;
+            try { Console.Title = "CMZ Dedicated Steam Server - Terminal"; } catch { }
+
+            // Closing a console window sends CTRL_CLOSE_EVENT which terminates the
+            // process even when handled — grey out X so the server can't be
+            // accidentally killed; "gui" command returns to the GUI instead.
+            try
+            {
+                IntPtr conHwnd = GetConsoleWindow();
+                if (conHwnd != IntPtr.Zero)
+                    EnableMenuItem(GetSystemMenu(conHwnd, false), SC_CLOSE, MF_BYCOMMAND | MF_GRAYED);
+            }
+            catch
+            {
+            }
+
+            IntPtr hOut = CreateFile("CONOUT$", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+            IntPtr hIn = CreateFile("CONIN$", GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+
+            if (hOut != IntPtr.Zero && hOut != new IntPtr(-1))
+            {
+                SetStdHandle(STD_OUTPUT_HANDLE, hOut);
+                _conWriter = new StreamWriter(
+                    new FileStream(new Microsoft.Win32.SafeHandles.SafeFileHandle(hOut, true), FileAccess.Write))
+                { AutoFlush = true };
+                Console.SetOut(new TeeTextWriter(_pipeOut, _conWriter));
+
+                // Replay the log history the GUI already has so the terminal
+                // doesn't open empty.
+                foreach (string line in _recentLogLines)
+                {
+                    try { _conWriter.WriteLine(line); }
+                    catch { break; }
+                }
+            }
+
+            if (hIn != IntPtr.Zero && hIn != new IntPtr(-1))
+            {
+                SetStdHandle(STD_INPUT_HANDLE, hIn);
+                _conReader = new StreamReader(
+                    new FileStream(new Microsoft.Win32.SafeHandles.SafeFileHandle(hIn, true), FileAccess.Read));
+                var input = new Thread(() => TerminalInputLoop(_conReader))
+                {
+                    IsBackground = true,
+                    Name = "TerminalInputThread"
+                };
+                input.Start();
+            }
+
+            Log("Terminal attached. Type commands normally. Type 'gui' to return to the GUI window.");
+        }
+
+        private static void TerminalInputLoop(StreamReader reader)
+        {
+            try
+            {
+                while (_terminalMode)
+                {
+                    string line = reader.ReadLine();
+                    if (line == null)
+                        break;
+
+                    if (line.Trim().Equals("gui", StringComparison.OrdinalIgnoreCase))
+                    {
+                        ExitTerminalMode();
+                        break;
+                    }
+
+                    var server = _activeServer;
+                    var log = _activeLog;
+                    if (server != null && server.IsRunning && log != null)
+                        HandleConsoleCommand(server, line, log);
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private static void ExitTerminalMode()
+        {
+            if (!_terminalMode)
+                return;
+
+            _terminalMode = false;
+
+            try { _pipeOut?.WriteLine("@@GUISHOW"); _pipeOut?.Flush(); } catch { }
+            try { Console.SetOut(_pipeOut); } catch { }
+
+            // Dispose the CONIN$/CONOUT$ streams — open handles keep the console
+            // window alive after FreeConsole, and disposing CONIN$ wakes the
+            // blocked ReadLine on the input thread.
+            try { _conReader?.Dispose(); } catch { }
+            try { _conWriter?.Dispose(); } catch { }
+            _conReader = null;
+            _conWriter = null;
+
+            try { if (_pipeOutHandle != IntPtr.Zero) SetStdHandle(STD_OUTPUT_HANDLE, _pipeOutHandle); } catch { }
+            try { if (_pipeInHandle != IntPtr.Zero) SetStdHandle(STD_INPUT_HANDLE, _pipeInHandle); } catch { }
+            try { FreeConsole(); } catch { }
+
+            Log("[GUI] Terminal closed - GUI window restored.");
         }
 
         /// <summary>
@@ -602,6 +858,10 @@ namespace CMZDedicatedSteamServer
             {
                 // A dead console handle must never kill the writer thread.
             }
+
+            _recentLogLines.Enqueue(stampedLine);
+            while (_recentLogLines.Count > RecentLogLinesMax)
+                _recentLogLines.TryDequeue(out _);
 
             if (CommandAuditLogEnabled && IsCommandAuditLine(safeMessage))
                 AppendCommandAuditLogLine(stampedLine);

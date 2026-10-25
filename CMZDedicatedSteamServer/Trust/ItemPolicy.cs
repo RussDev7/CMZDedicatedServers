@@ -220,6 +220,7 @@ namespace CMZDedicatedSteamServer.Trust
         private static HashSet<int> _remoteAlterBlockIds = new HashSet<int>();
         private static HashSet<int> _lootAlterBlockIds = new HashSet<int>();
         private static Type _blockTypeEnumType;
+        private static Type _itemIdEnumType;
         private static int _tntBlockType = -1;
         private static int _c4BlockType = -1;
         private static int _surfaceLavaBlockType = -1;
@@ -312,6 +313,12 @@ namespace CMZDedicatedSteamServer.Trust
         }
 
         /// <summary>
+        /// The reflected InventoryItemIDs enum, retained for display lookups
+        /// (PlayerInspection.DescribeItem).
+        /// </summary>
+        internal static Type ItemIdEnumType => _itemIdEnumType;
+
+        /// <summary>
         /// Resolves the InventoryItemIDs enum into numeric id sets and pulls the
         /// real recipe book + loot table + block map out of the game assembly.
         /// Called once during world init after the item registry is populated.
@@ -342,6 +349,8 @@ namespace CMZDedicatedSteamServer.Trust
                         _maxItemId = id;
                 }
                 _maxItemId++; // ids are 0..max inclusive
+
+                _itemIdEnumType = inventoryItemIdsType;
 
                 _blockTypeEnumType = blockTypeEnumType != null && blockTypeEnumType.IsEnum ? blockTypeEnumType : null;
 

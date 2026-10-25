@@ -51,6 +51,7 @@ namespace CMZDedicatedSteamServer.Commands
         private readonly Action _reloadPlugins;
         private readonly Action _restartServer;
         private readonly Func<string, ServerCommandTarget> _resolveTarget;
+        private readonly Func<string, string> _getPlayerInfoText;
 
         public ServerCommandManager(
             string baseDir,
@@ -62,7 +63,8 @@ namespace CMZDedicatedSteamServer.Commands
             Action reloadAll,
             Action reloadPlugins,
             Action restartServer,
-            Func<string, ServerCommandTarget> resolveTarget)
+            Func<string, ServerCommandTarget> resolveTarget,
+            Func<string, string> getPlayerInfoText)
         {
             _log = log ?? (_ => { });
             _getPlayerListText = getPlayerListText;
@@ -73,6 +75,7 @@ namespace CMZDedicatedSteamServer.Commands
             _reloadPlugins = reloadPlugins;
             _restartServer = restartServer;
             _resolveTarget = resolveTarget;
+            _getPlayerInfoText = getPlayerInfoText;
 
             _permissions = new ServerCommandPermissionStore(baseDir, _log);
 
@@ -294,6 +297,13 @@ namespace CMZDedicatedSteamServer.Commands
                 HandlePlayers);
 
             Register(
+                "playerinfo",
+                "playerinfo <player|id|steamid>",
+                "Shows server-side inspection data for a connected player.",
+                ServerCommandRank.Moderator,
+                HandlePlayerInfo);
+
+            Register(
                 "status",
                 "status",
                 "Shows server status and information.",
@@ -400,6 +410,21 @@ namespace CMZDedicatedSteamServer.Commands
                     required +
                     "]");
             }
+        }
+
+        private void HandlePlayerInfo(ServerCommandContext context, string[] args)
+        {
+            if (args == null || args.Length == 0 || string.IsNullOrWhiteSpace(args[0]))
+            {
+                _log("[Commands] Usage: playerinfo <player|id|steamid>");
+                return;
+            }
+
+            string text = _getPlayerInfoText != null
+                ? _getPlayerInfoText(args[0])
+                : "Player info is not available on this host.";
+            if (!string.IsNullOrWhiteSpace(text))
+                _log(text);
         }
 
         private void HandlePlayers(ServerCommandContext context, string[] args)

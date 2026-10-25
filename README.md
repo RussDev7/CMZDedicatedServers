@@ -480,6 +480,7 @@ Launching `CMZDedicatedSteamServer.exe` with no arguments opens a desktop window
 - **Players tab**: connected player cards with name, SteamID, session time, and Kick/Ban/copy actions (expand arrow or right-click).
 - **Settings tab**: a `server.properties` editor that mirrors the file's own sections and order — every key in the file gets a row, including ones the editor doesn't recognize (shown under their raw name). Boolean and enumerated fields get wheel-safe dropdowns (scrolling the page can't flip values); **Save to file** writes back preserving comments and ordering (with a `.bak` backup); a `FileSystemWatcher` auto-reloads the editor when the file changes on disk, and a filter box narrows rows live.
 - **Appearance**: accent color presets + custom picker and console text color, stored in `GuiSettings.ini` next to the exe.
+- **Terminal button**: detaches the running server into a real console window (the child process calls `AllocConsole`) without restarting — output tees to both sides so GUI history stays complete. The console's X is disabled (closing a console force-kills the owning process); type `gui` + Enter in the terminal to return to the GUI. Ctrl+C still stops the server.
 
 The GUI runs the server as a hidden `--console` child process; closing the window requires stopping the server first.
 

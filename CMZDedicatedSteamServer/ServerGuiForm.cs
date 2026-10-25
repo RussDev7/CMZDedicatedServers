@@ -43,7 +43,9 @@ namespace CMZDedicatedSteamServer
         private readonly Button _startButton = new Button();
         private readonly Button _stopButton = new Button();
         private readonly Button _restartButton = new Button();
+        private readonly Button _terminalButton = new Button();
         private readonly Timer _restartCountdownTimer = new Timer();
+        private readonly Timer _playersHeartbeatTimer = new Timer();
 
         private readonly Panel _statusDot = new Panel();
         private readonly Label _statusText = new Label();
@@ -207,6 +209,7 @@ namespace CMZDedicatedSteamServer
         private readonly ConcurrentQueue<string> _pendingConsoleLines = new ConcurrentQueue<string>();
         private readonly Dictionary<ulong, string> _pendingNamesBySteamId = new Dictionary<ulong, string>();
         private readonly Dictionary<byte, ulong> _steamIdsByGid = new Dictionary<byte, ulong>();
+        private readonly Dictionary<string, string> _playerInfoBySteamId = new Dictionary<string, string>();
         private int _placeholderPlayerNumber;
         private const int LargePlayerListThreshold = 24;
         private const int StartupErrorLineLimit = 6;
@@ -317,11 +320,15 @@ namespace CMZDedicatedSteamServer
             Text = "CMZ Dedicated Steam Server";
             Width = 1040;
             Height = 680;
-            MinimumSize = new Size(880, 560);
+            MinimumSize = new Size(1060, 600);
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = C_Bg;
             ForeColor = C_Text;
             Font = new Font("Segoe UI", 9f, FontStyle.Regular);
+
+            // Stay invisible until the OnShown warm-up finishes — otherwise the
+            // per-page pre-layout paints the half-built skeleton for a moment.
+            Opacity = 0;
 
             LoadGuiSettings();
 
@@ -359,9 +366,11 @@ namespace CMZDedicatedSteamServer
             ConfigureHeaderButton(_startButton, "Start", 78, _accent, (_, __) => StartServer());
             ConfigureHeaderButton(_stopButton, "Stop", 78, C_ChromeOff, (_, __) => StopServer());
             ConfigureHeaderButton(_restartButton, "Restart", 92, C_ChromeOff, (_, __) => SendCommandInternal("!restart"));
+            ConfigureHeaderButton(_terminalButton, "Terminal", 88, C_ChromeOff, (_, __) => SwitchToTerminal());
             buttonsPanel.Controls.Add(_startButton);
             buttonsPanel.Controls.Add(_stopButton);
             buttonsPanel.Controls.Add(_restartButton);
+            buttonsPanel.Controls.Add(_terminalButton);
 
             var chipsPanel = new FlowLayoutPanel
             {
@@ -552,6 +561,10 @@ namespace CMZDedicatedSteamServer
             };
             _restartCountdownTimer.Start();
 
+            _playersHeartbeatTimer.Interval = 500;
+            _playersHeartbeatTimer.Tick += PlayersHeartbeat_Tick;
+            _playersHeartbeatTimer.Start();
+
             _consoleFlushTimer.Interval = 50;
             _consoleFlushTimer.Tick += (_, __) => FlushPendingConsoleLines();
             _consoleFlushTimer.Start();
@@ -597,6 +610,13 @@ namespace CMZDedicatedSteamServer
             SetDoubleBuffered(_settingsPage);
             SetDoubleBuffered(_settingsServerGrid);
             SetDoubleBuffered(_playersList);
+
+            // Nothing in the header is allowed to clip: the minimum width is the
+            // actual laid-out width of title + buttons + chips + padding.
+            int headerNeeded = titleCell.Width + buttonsPanel.PreferredSize.Width
+                + chipsPanel.PreferredSize.Width + header.Padding.Horizontal + 16;
+            if (headerNeeded > MinimumSize.Width)
+                MinimumSize = new Size(headerNeeded, MinimumSize.Height);
         }
 
         // ================= UI construction =================
@@ -664,42 +684,73 @@ namespace CMZDedicatedSteamServer
             // visit to each tab would lay out ~200 controls live and paint
             // mid-reflow. Pre-layout every page here — all inside OnShown, so no
             // paint happens until we return and the swaps are never visible.
-            _contentHost.SuspendLayout();
-            foreach (Control page in _contentHost.Controls)
+            try
             {
-                page.Visible = true;
-                page.PerformLayout();
-                try
+                _contentHost.SuspendLayout();
+                foreach (Control page in _contentHost.Controls)
                 {
-                    using (var warm = new Bitmap(page.Width, page.Height))
-                        page.DrawToBitmap(warm, new Rectangle(0, 0, page.Width, page.Height));
-                }
-                catch
-                {
-                }
-
-                // Settle AutoScroll extent now — otherwise the scrollbar appears on
-                // the first real show and re-lays every row (visible reflow).
-                foreach (ScrollableControl scrollable in new ScrollableControl[] { _settingsServerGrid, _playersList })
-                {
-                    if (scrollable.AutoScroll)
+                    page.Visible = true;
+                    page.PerformLayout();
+                    try
                     {
-                        try
+                        using (var warm = new Bitmap(page.Width, page.Height))
+                            page.DrawToBitmap(warm, new Rectangle(0, 0, page.Width, page.Height));
+                    }
+                    catch
+                    {
+                    }
+
+                    // Settle AutoScroll extent now — otherwise the scrollbar appears on
+                    // the first real show and re-lays every row (visible reflow).
+                    foreach (ScrollableControl scrollable in new ScrollableControl[] { _settingsServerGrid, _playersList })
+                    {
+                        if (scrollable.AutoScroll)
                         {
-                            scrollable.AutoScrollPosition = new Point(0, 100000);
-                            scrollable.AutoScrollPosition = Point.Empty;
-                        }
-                        catch
-                        {
+                            try
+                            {
+                                scrollable.AutoScrollPosition = new Point(0, 100000);
+                                scrollable.AutoScrollPosition = Point.Empty;
+                            }
+                            catch
+                            {
+                            }
                         }
                     }
-                }
 
-                page.Visible = false;
+                    page.Visible = false;
+                }
+            }
+            finally
+            {
+                _contentHost.ResumeLayout(true);
+                ActivateTab(_activeTab);
+                Opacity = 100;
+            }
+        }
+
+        // Detaches the server child into a REAL console window (child calls
+        // AllocConsole) and hides this GUI. Output tees to both so this console's
+        // history stays complete. Closing the console window returns to the GUI.
+        private void SwitchToTerminal()
+        {
+            if (_serverProcess == null || _serverProcess.HasExited)
+            {
+                ShowToast("Start the server first — the terminal attaches to the running server.");
+                return;
             }
 
-            _contentHost.ResumeLayout(true);
-            ActivateTab(_activeTab);
+            SendCommandInternal("@@TERMINAL");
+            ShowInTaskbar = false;
+            Visible = false;
+        }
+
+        private void RestoreGuiWindow()
+        {
+            if (WindowState == FormWindowState.Minimized)
+                WindowState = FormWindowState.Normal;
+            ShowInTaskbar = true;
+            Visible = true;
+            Activate();
         }
 
         private void ActivateTab(string tabKey)
@@ -2259,6 +2310,7 @@ namespace CMZDedicatedSteamServer
             _currentTpsText = "--";
             _pendingNamesBySteamId.Clear();
             _steamIdsByGid.Clear();
+            _playerInfoBySteamId.Clear();
             _playersList.Controls.Clear();
             _playersFilterInput.Clear();
             UpdatePlayersEmptyState();
@@ -2294,6 +2346,26 @@ namespace CMZDedicatedSteamServer
                     return;
                 }
 
+                if (e.Data.StartsWith("@@PINFO ", StringComparison.Ordinal))
+                {
+                    string payload = e.Data.Substring(8);
+                    BeginInvoke((Action)(() => HandlePlayerInfoLine(payload)));
+                    return;
+                }
+
+                if (e.Data.StartsWith("@@PLAYERS", StringComparison.Ordinal))
+                {
+                    string roster = e.Data.Substring(9);
+                    BeginInvoke((Action)(() => ReconcilePlayerCards(roster)));
+                    return;
+                }
+
+                if (string.Equals(e.Data, "@@GUISHOW", StringComparison.Ordinal))
+                {
+                    BeginInvoke((Action)RestoreGuiWindow);
+                    return;
+                }
+
                 AppendLine(e.Data);
             };
             _serverProcess.ErrorDataReceived += (_, e) =>
@@ -2307,6 +2379,9 @@ namespace CMZDedicatedSteamServer
             };
             _serverProcess.Exited += (_, __) => BeginInvoke((Action)(() =>
             {
+                if (!Visible)
+                    RestoreGuiWindow();
+
                 bool earlyStartupExit = !_serverReady
                     && !_stopRequestedByUser
                     && DateTime.UtcNow - _lastStartAttemptUtc <= StartupFailureWindow;
@@ -2556,8 +2631,11 @@ namespace CMZDedicatedSteamServer
 
             if (line.IndexOf("[GUI]", StringComparison.OrdinalIgnoreCase) >= 0
                 || line.IndexOf("[SteamLobby]", StringComparison.OrdinalIgnoreCase) >= 0
+                || line.IndexOf("[Steam Lobby]", StringComparison.OrdinalIgnoreCase) >= 0
                 || line.IndexOf("[StatusChanged]", StringComparison.OrdinalIgnoreCase) >= 0
+                || line.IndexOf("[Status Changed]", StringComparison.OrdinalIgnoreCase) >= 0
                 || line.IndexOf("[ConnectionApproval]", StringComparison.OrdinalIgnoreCase) >= 0
+                || line.IndexOf("[Connection Approval]", StringComparison.OrdinalIgnoreCase) >= 0
                 || line.IndexOf("[Handshake]", StringComparison.OrdinalIgnoreCase) >= 0)
                 return Color.FromArgb(140, 160, 195);
 
@@ -2804,10 +2882,43 @@ namespace CMZDedicatedSteamServer
             return line.Substring(0, maxPreviewLength) + "...";
         }
 
+        // FormatLogMessage humanizes these prefixes at the output boundary; all
+        // GUI parsers key on the raw emitted forms, so reverse them here first.
+        private static readonly (string Spaced, string Raw)[] LogPrefixNormalizeMap =
+        {
+            ("[Status Changed]", "[StatusChanged]"),
+            ("[Host Message]", "[HostMsg]"),
+            ("[Connection Approval]", "[ConnectionApproval]"),
+            ("[Player Enforcement]", "[PlayerEnforcement]"),
+            ("[Combat Evidence]", "[CombatEvidence]"),
+            ("[Shadow Combat]", "[ShadowCombat]"),
+            ("[Assembly Resolve]", "[AssemblyResolve]"),
+            ("[Main Loop]", "[MainLoop]"),
+            ("[Steam Lobby]", "[SteamLobby]"),
+        };
+
+        private static string NormalizeLogPrefix(string line)
+        {
+            if (string.IsNullOrEmpty(line))
+                return line;
+            // Label sits right after the "[yyyy-MM-dd HH:mm:ss] " stamp (~22 chars);
+            // bound the search so text later in the line is never rewritten.
+            int scanEnd = Math.Min(line.Length, 64);
+            foreach ((string spaced, string raw) in LogPrefixNormalizeMap)
+            {
+                int at = line.IndexOf(spaced, 0, scanEnd, StringComparison.Ordinal);
+                if (at >= 0)
+                    return line.Substring(0, at) + raw + line.Substring(at + spaced.Length);
+            }
+            return line;
+        }
+
         private void ProcessPlayerCountLine(string line)
         {
             if (string.IsNullOrWhiteSpace(line))
                 return;
+
+            line = NormalizeLogPrefix(line);
 
             if (line.IndexOf("[World] World handler initialized.", StringComparison.OrdinalIgnoreCase) >= 0)
             {
@@ -3310,6 +3421,20 @@ namespace CMZDedicatedSteamServer
                 string playerName = row.AccessibleName ?? "player";
                 SendCommandInternal("ban \"" + playerName.Replace("\"", string.Empty) + "\"");
             });
+            menu.Items.Add(new ToolStripSeparator());
+
+            var rankMenu = new ToolStripMenuItem("Set rank");
+            foreach (string rank in new[] { "Visitor", "Member", "Moderator", "Admin" })
+            {
+                string captured = rank;
+                rankMenu.DropDownItems.Add(rank, null, (_, __) =>
+                {
+                    string steamText = row.Tag as string ?? string.Empty;
+                    if (steamText.Length > 0 && !steamText.StartsWith("placeholder-", StringComparison.Ordinal))
+                        SendCommandInternal("setrank " + steamText + " " + captured);
+                });
+            }
+            menu.Items.Add(rankMenu);
             return menu;
         }
 
@@ -3373,11 +3498,33 @@ namespace CMZDedicatedSteamServer
             var detailsPanel = new Panel
             {
                 Dock = DockStyle.Top,
-                Height = 52,
+                Height = 118,
                 Padding = new Padding(18, 8, 14, 8),
                 BackColor = C_RowDeep,
                 Visible = false,
                 Tag = "details"
+            };
+
+            var infoLabel = new Label
+            {
+                Dock = DockStyle.Top,
+                Height = 66,
+                Text = "Player info: expand to load",
+                TextAlign = ContentAlignment.TopLeft,
+                Font = new Font("Consolas", 8.5f, FontStyle.Regular),
+                ForeColor = C_TextDim,
+                BackColor = Color.Transparent,
+                Tag = "pinfo",
+                AutoEllipsis = true
+            };
+
+            var bottomRow = new Panel
+            {
+                Dock = DockStyle.Bottom,
+                Height = 36,
+                BackColor = Color.Transparent,
+                Margin = new Padding(0),
+                Padding = new Padding(0)
             };
 
             var buttonsPanel = new FlowLayoutPanel
@@ -3415,15 +3562,23 @@ namespace CMZDedicatedSteamServer
                 SendCommandInternal("ban \"" + playerName.Replace("\"", string.Empty) + "\"");
             });
 
+            var refreshButton = CreatePlayerDetailButton("Refresh", false, (_, __) =>
+            {
+                string steamText = row.Tag as string ?? string.Empty;
+                if (steamText.Length > 0 && !steamText.StartsWith("placeholder-", StringComparison.Ordinal))
+                    SendCommandInternal("@@PINFO " + steamText);
+            });
+
             buttonsPanel.Controls.Add(copyNameButton);
             buttonsPanel.Controls.Add(copyButton);
             buttonsPanel.Controls.Add(kickButton);
             buttonsPanel.Controls.Add(banButton);
+            buttonsPanel.Controls.Add(refreshButton);
 
             var sessionLabel = new Label
             {
                 Dock = DockStyle.Right,
-                Width = 190,
+                Width = 230,
                 Text = "",
                 TextAlign = ContentAlignment.MiddleRight,
                 Font = new Font("Segoe UI", 8.5f, FontStyle.Regular),
@@ -3431,9 +3586,11 @@ namespace CMZDedicatedSteamServer
                 BackColor = Color.Transparent,
                 Tag = "session"
             };
-            detailsPanel.Controls.Add(buttonsPanel);
-            detailsPanel.Controls.Add(sessionLabel);
+            bottomRow.Controls.Add(buttonsPanel);
+            bottomRow.Controls.Add(sessionLabel);
             buttonsPanel.BringToFront();
+            detailsPanel.Controls.Add(bottomRow);
+            detailsPanel.Controls.Add(infoLabel);
             return detailsPanel;
         }
 
@@ -3507,35 +3664,182 @@ namespace CMZDedicatedSteamServer
 
             bool willExpand = !detailsPanel.Visible;
             detailsPanel.Visible = willExpand;
-            row.Height = willExpand ? 108 : 56;
+            row.Height = willExpand ? 174 : 56;
             button.Text = willExpand ? "▴" : "▾";
 
             if (willExpand)
             {
                 string steamText = row.Tag as string ?? string.Empty;
-                foreach (Control child in detailsPanel.Controls)
-                {
-                    if (string.Equals(child.Tag as string, "session", StringComparison.Ordinal))
-                    {
-                        string text = "SteamID  " + steamText;
-                        if (_connectTimesUtcBySteamId.TryGetValue(steamText, out DateTime connectedUtc))
-                        {
-                            TimeSpan session = DateTime.UtcNow - connectedUtc;
-                            string sessionText = session.TotalHours >= 1
-                                ? $"{(int)session.TotalHours}h {session.Minutes}m"
-                                : session.TotalMinutes >= 1
-                                    ? $"{(int)session.TotalMinutes}m {session.Seconds}s"
-                                    : $"{(int)Math.Max(0, session.TotalSeconds)}s";
-                            text = "Online for " + sessionText + "   SteamID  " + steamText;
-                        }
-                        child.Text = text;
-                    }
-                }
+                RefreshPlayerSessionLabel(row, steamText);
+                RefreshPlayerInfoLabel(row);
+                if (steamText.Length > 0 && !steamText.StartsWith("placeholder-", StringComparison.Ordinal))
+                    SendCommandInternal("@@PINFO " + steamText);
             }
             ResizePlayerCards();
             if (_playersList.Controls.Count < LargePlayerListThreshold)
                 _playersList.PerformLayout();
             _playersList.Invalidate();
+        }
+
+        private static Control FindPlayerDetailChild(Control root, string tag)
+        {
+            foreach (Control child in root.Controls)
+            {
+                if (string.Equals(child.Tag as string, tag, StringComparison.Ordinal))
+                    return child;
+                Control found = FindPlayerDetailChild(child, tag);
+                if (found != null)
+                    return found;
+            }
+            return null;
+        }
+
+        // Reconciles the cards against the server's authoritative roster
+        // (@@PLAYERS). Adds missing cards, removes every card whose steamid is
+        // no longer connected — including placeholders whose join never
+        // finished — so the tab can never drift from reality.
+        private void ReconcilePlayerCards(string roster)
+        {
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (string entry in roster.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string[] parts = entry.Split('|');
+                if (parts.Length < 3)
+                    continue;
+                string gid = parts[0].Trim();
+                string name = parts[1].Trim();
+                string steamText = parts[2].Trim();
+                if (steamText.Length == 0)
+                    continue;
+                seen.Add(steamText);
+
+                bool exists = _playersList.Controls
+                    .Cast<Control>()
+                    .Any(c => string.Equals(c.Tag as string, steamText, StringComparison.Ordinal));
+                if (!exists)
+                    UpsertPlayerCard(gid, name.Length > 0 ? name : "Unknown", steamText);
+            }
+
+            _connectedPlayers = seen.Count;
+
+            _playersList.SuspendLayout();
+            for (int i = _playersList.Controls.Count - 1; i >= 0; i--)
+            {
+                string tag = _playersList.Controls[i].Tag as string;
+                if (tag == null || !seen.Contains(tag))
+                    _playersList.Controls.RemoveAt(i);
+            }
+            _playersList.ResumeLayout(true);
+            ApplyPlayersFilter();
+            UpdatePlayersEmptyState();
+            SetRunningState(_serverProcess != null && !_serverProcess.HasExited);
+        }
+
+        private int _playersHeartbeatTicks;
+
+        // 500ms heartbeat: roster re-poll every 4th tick (~2s); expanded cards
+        // get a fresh @@PINFO every tick so Position/Traffic/Inventory track
+        // live, and the "Online for" label updates in place.
+        private void PlayersHeartbeat_Tick(object sender, EventArgs e)
+        {
+            if (_serverProcess == null || _serverProcess.HasExited)
+                return;
+
+            if (++_playersHeartbeatTicks % 4 == 0)
+                SendCommandInternal("@@PLAYERS");
+
+            foreach (Control control in _playersList.Controls)
+            {
+                if (!(control is Panel row))
+                    continue;
+                string tag = row.Tag as string ?? string.Empty;
+                if (tag.Length == 0 || tag.StartsWith("placeholder-", StringComparison.Ordinal))
+                    continue;
+                Control details = row.Controls
+                    .Cast<Control>()
+                    .FirstOrDefault(c => string.Equals(c.Tag as string, "details", StringComparison.Ordinal));
+                if (details == null || !details.Visible)
+                    continue;
+                SendCommandInternal("@@PINFO " + tag);
+                RefreshPlayerSessionLabel(row, tag);
+            }
+        }
+
+        private void RefreshPlayerSessionLabel(Panel row, string steamText)
+        {
+            Control sessionLabel = FindPlayerDetailChild(row, "session");
+            if (sessionLabel == null)
+                return;
+            string text = "SteamID  " + steamText;
+            if (_connectTimesUtcBySteamId.TryGetValue(steamText, out DateTime connectedUtc))
+            {
+                TimeSpan session = DateTime.UtcNow - connectedUtc;
+                string sessionText = session.TotalHours >= 1
+                    ? $"{(int)session.TotalHours}h {session.Minutes}m"
+                    : session.TotalMinutes >= 1
+                        ? $"{(int)session.TotalMinutes}m {session.Seconds}s"
+                        : $"{(int)Math.Max(0, session.TotalSeconds)}s";
+                text = "Online for " + sessionText + "   SteamID  " + steamText;
+            }
+            sessionLabel.Text = text;
+        }
+
+        private void HandlePlayerInfoLine(string payload)
+        {
+            // Format: <steamid>|<name>|<rank>|<announced>|<pos>|<strikes>|<inventory>
+            int bar = payload.IndexOf('|');
+            if (bar <= 0)
+                return;
+            string steamText = payload.Substring(0, bar).Trim();
+            _playerInfoBySteamId[steamText] = payload.Substring(bar + 1);
+
+            foreach (Control control in _playersList.Controls)
+            {
+                if (control is Panel row &&
+                    string.Equals(row.Tag as string, steamText, StringComparison.Ordinal))
+                {
+                    RefreshPlayerInfoLabel(row);
+                }
+            }
+        }
+
+        private void RefreshPlayerInfoLabel(Panel row)
+        {
+            Panel detailsPanel = null;
+            foreach (Control control in row.Controls)
+            {
+                if (string.Equals(control.Tag as string, "details", StringComparison.Ordinal))
+                {
+                    detailsPanel = control as Panel;
+                    break;
+                }
+            }
+            Control infoLabel = detailsPanel != null
+                ? FindPlayerDetailChild(detailsPanel, "pinfo")
+                : null;
+            if (infoLabel == null)
+                return;
+
+            string steamText = row.Tag as string ?? string.Empty;
+            if (!_playerInfoBySteamId.TryGetValue(steamText, out string data))
+            {
+                infoLabel.Text = "Player info: requesting from server...";
+                return;
+            }
+
+            string[] parts = data.Split('|');
+            if (parts.Length < 6)
+            {
+                infoLabel.Text = "Player info: no trust data yet";
+                return;
+            }
+
+            string rankPart = parts[1] + (parts[2] == "1" ? "" : "  (not announced)");
+            string trafficPart = parts.Length > 6 ? parts[6] : "";
+            infoLabel.Text =
+                "Position  " + parts[3] + "    Rank  " + rankPart + "    Strikes  " + parts[4] + "\r\n" +
+                (trafficPart.Length > 0 ? "Packets   " + trafficPart + "\r\n" : "") +
+                "Inventory  " + parts[5];
         }
 
         private void EnsurePlayerCardsMatchCount()

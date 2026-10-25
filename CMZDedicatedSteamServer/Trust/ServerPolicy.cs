@@ -7,6 +7,8 @@ This file is part of https://github.com/RussDev7/CMZDedicatedServers - see LICEN
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
+using System.Text;
 using CMZDedicatedSteamServer.Commands;
 using CMZDedicatedSteamServer.Config;
 
@@ -587,6 +589,13 @@ namespace CMZDedicatedSteamServer.Trust
         /// to flag claimed positions embedded inside solid blocks (noclip).
         /// </summary>
         private TerrainProbe.TryGetSavedBlockTypeDelegate _worldBlockProbe;
+
+        /// <summary>
+        /// Fired when a join/respawn baseline lands inside solid blocks — the
+        /// host carves the player out of the terrain and broadcasts the edit.
+        /// Args: steamId, cellX, cellY, cellZ.
+        /// </summary>
+        private Action<ulong, int, int, int> _spawnUnbury;
 
         private readonly bool _flightAllowed;
         private readonly bool _teleportModeAllowed;
@@ -2801,6 +2810,52 @@ namespace CMZDedicatedSteamServer.Trust
         }
 
         /// <summary>
+        /// Exposes the server-owned trust state of one player for the
+        /// playerinfo inspection surface. Returns a data-only snapshot —
+        /// formatting lives in PlayerInspection.
+        /// </summary>
+        public bool TrySnapshotPlayer(byte gid, out PlayerTrustSnapshot snapshot)
+        {
+            snapshot = null;
+            if (!_players.TryGetValue(gid, out PlayerTrustState s) || s == null)
+                return false;
+
+            snapshot = new PlayerTrustSnapshot
+            {
+                Gid = gid,
+                SteamId = s.RemoteId,
+                Name = s.Name,
+                Rank = s.Rank.ToString(),
+                Announced = s.Announced,
+                WasDead = s.WasDead,
+                HasBaseline = s.HasBaseline,
+                X = s.LastX,
+                Y = s.LastY,
+                Z = s.LastZ,
+                HasInventory = s.Owned != null,
+            };
+
+            var parts = new List<string>();
+            foreach (var kv in s.ViolationBuckets)
+            {
+                if (kv.Value.Count <= 0)
+                    continue;
+                snapshot.StrikeTotal += kv.Value.Count;
+                parts.Add(kv.Key + ":" + kv.Value.Count);
+            }
+            snapshot.StrikeBreakdown = snapshot.StrikeTotal == 0 ? "none" : string.Join(", ", parts);
+
+            if (s.Owned != null)
+            {
+                snapshot.Inventory = s.Owned
+                    .Where(kv => kv.Value > 0)
+                    .OrderByDescending(kv => kv.Value)
+                    .ToList();
+            }
+            return true;
+        }
+
+        /// <summary>
         /// Reads the length-prefixed UTF-8 string after the BroadcastTextMessage
         /// id byte. Returns false for malformed payloads (they drop elsewhere).
         /// </summary>
@@ -3947,6 +4002,44 @@ namespace CMZDedicatedSteamServer.Trust
             _savedBlockLookup = lookup;
         }
 
+        /// <summary>
+        /// Wires the spawn-unbury action: called when a join/respawn baseline
+        /// lands inside solid terrain so the host can carve the player out.
+        /// </summary>
+        public void SetSpawnUnburyHandler(Action<ulong, int, int, int> unbury)
+        {
+            _spawnUnbury = unbury;
+        }
+
+        /// <summary>
+        /// Join/respawn baseline landed inside solid cells (spawn point buried
+        /// by regenerated terrain or edits). Vanilla ejects slowly or the player
+        /// digs — instead the server carves the 3-cell body column and
+        /// broadcasts it, so they are never buried in the first place.
+        /// </summary>
+        private void TryUnburySpawn(PlayerTrustState state, float x, float y, float z)
+        {
+            if (_spawnUnbury == null || !ItemPolicy.Ready || state.RemoteId == 0)
+                return;
+
+            int fx = (int)Math.Floor(x);
+            int fy = (int)Math.Floor(y);
+            int fz = (int)Math.Floor(z);
+
+            bool buried = false;
+            for (int cy = fy; cy <= fy + 1 && !buried; cy++)
+            {
+                buried = TryGetWorldBlock(fx, cy, fz, out int t) &&
+                         ItemPolicy.IsPlayerBlockingBlockType(t) &&
+                         !ItemPolicy.IsDoorBlockType(t);
+            }
+            if (!buried)
+                return;
+
+            _spawnUnbury(state.RemoteId, fx, fy, fz);
+            _log($"[Trust] {state.Name}: spawn position buried at ({fx},{fy},{fz}) — carved air pocket.");
+        }
+
         /// <summary>Wires the full world block lookup (saved edits + generated terrain).</summary>
         public void SetWorldBlockProbe(TerrainProbe.TryGetSavedBlockTypeDelegate lookup)
         {
@@ -4845,6 +4938,8 @@ namespace CMZDedicatedSteamServer.Trust
             {
                 ResetEnvironmentTimers(state);
                 Accept(state, x, y, z, now, dead);
+                if (!dead)
+                    TryUnburySpawn(state, x, y, z);
                 return true;
             }
 
@@ -4853,6 +4948,7 @@ namespace CMZDedicatedSteamServer.Trust
             {
                 ResetEnvironmentTimers(state);
                 Accept(state, x, y, z, now, dead);
+                TryUnburySpawn(state, x, y, z);
                 return true;
             }
 
@@ -5296,9 +5392,10 @@ namespace CMZDedicatedSteamServer.Trust
             // teleport, canary, ghost, godmode, reach) kick at the global
             // default of 5.
             int kickThreshold =
-                kind == "fly" || kind == "speed" || kind == "noclip" ||
-                kind == "item"
-                    ? 10 : _config.TrustViolationsKick;
+                kind == "noclip"
+                    ? 6
+                    : kind == "fly" || kind == "speed" || kind == "item"
+                        ? 10 : _config.TrustViolationsKick;
             _log($"[Trust] {state.Name}: {kind} violation ({detail}) [{bucket.Count}/{kickThreshold}]");
 
             string target = state.RemoteId != 0UL ? state.RemoteId.ToString() : state.Name;

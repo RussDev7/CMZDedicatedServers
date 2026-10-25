@@ -2694,6 +2694,24 @@ namespace CMZDedicatedSteamServer
         }
 
         /// <summary>
+        /// Spawn-unbury: a join/respawn baseline the trust policy proved sits
+        /// inside solid terrain. Carves the 3-cell body column (feet, head,
+        /// headroom) into the saved delta and returns one AlterBlock payload
+        /// per cell for the host to broadcast to every client — including the
+        /// buried player, whose own client must render the freed pocket.
+        /// </summary>
+        public List<byte[]> CarveSpawnPocket(int x, int y, int z)
+        {
+            var payloads = new List<byte[]>(3);
+            for (int cy = y; cy <= y + 2; cy++)
+            {
+                ApplyTerrainBlockChange(x, cy, z, 0);
+                payloads.Add(BuildAlterBlockMessagePayload(x, cy, z, 0));
+            }
+            return payloads;
+        }
+
+        /// <summary>
         /// Writes back cells the trust layer queued for rollback (the dig that
         /// seeded a denied chopper batch) and relays a synthetic AlterBlock to
         /// every connected client so the restored block visibly reappears for
